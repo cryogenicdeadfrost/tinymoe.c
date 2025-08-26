@@ -1,75 +1,64 @@
 moe.c
 
-A from-scratch implementation of a Mixture-of-Experts (MoE) Transformer language model in a single C file. This project is a complete end-to-end pipeline for training and inference, designed for educational purposes.
+I took a Mixture-of-Experts (MoE) Transformer, threw it in a blender with the C programming language, and refused to stop until it all fit into one file. This is the result.
 
-Inspired by Andrej Karpathy's minimalist, from-scratch deep learning projects like llm.c.
-Philosophy
+This project is a from-scratch, single-file implementation of a complete MoE Transformer lifecycle: training, inference, saving, and loading. It's designed to be a deeply educational tool for understanding how modern, sparse models work under the hood.
 
-The goal of this project is to demystify the Mixture-of-Experts architecture, which is becoming increasingly prevalent in state-of-the-art language models. While frameworks like PyTorch and TensorFlow provide powerful abstractions, they can obscure the fundamental mechanics of how these models work.
+Inspired by (and eternally grateful for) Andrej Karpathy's minimalist deep learning projects like llama2.c and llm.c.
+What is this?
 
-moe.c follows a different philosophy:
+State-of-the-art language models are increasingly using a Mixture-of-Experts architecture to scale up parameter counts without a proportional increase in compute. But how does that actually work? How does a "gating network" route tokens? How do you backpropagate through a sparse, dynamic choice?
 
-    Single File: The entire model—architecture, forward pass, backward pass, optimizer, and data loader—is contained in this one file.
+This project answers those questions by building one from the ground up. The philosophy is simple:
 
-    No Dependencies: The code is written in pure C with only the standard library and the math library. No BLAS, no CUDA, no magic.
+    One File to Rule Them All. The entire model—architecture, forward(), backward(), the Adam optimizer, data loading, everything—is in moe.c. If you can read C, you can understand the entire stack.
 
-    Educational Clarity: The code is heavily commented and structured to be read from top to bottom, explaining each component from the ground up.
+    No Magic. The only #includes are for the standard library. There are no dependencies, no BLAS, no CUDA, no PyTorch. Just you, the C code, and the horrifyingly beautiful dance of backpropagation.
 
-By building everything from scratch, we can gain a deeper intuition for the entire lifecycle of a neural network, from memory allocation and weight initialization to the intricate dance of backpropagation.
+    Clarity Over All. The code is heavily commented and structured to be a narrative. It's meant to be read, not just run.
+
+By stripping away all abstractions, we can get a raw, unfiltered look at the mechanics of a modern neural network.
 Architecture
 
-This project implements a standard GPT-2 style Transformer, but with a key modification: the feed-forward network (FFN) in each block is replaced by a Mixture of Experts (MoE) layer.
+This is a standard GPT-2 style Transformer, but we've performed a bit of surgery on its feed-forward network (FFN) block. Instead of a single, dense FFN, each layer has a Mixture of Experts (MoE) layer:
 
-Each MoE layer consists of:
+    The Gatekeeper (Gating Network): A tiny linear layer that acts as a bouncer. It looks at each incoming token and produces a set of scores, deciding which "expert" is best suited for the job.
 
-    A Gating Network: A small, learnable router that examines each token and decides which experts are best suited to process it.
+    The Specialists (Experts): A pool of several independent FFNs. Each one might learn to specialize in something different (e.g., punctuation, nouns, Python code, who knows?).
 
-    A Set of Experts: Multiple independent FFNs that specialize in different aspects of the data.
+    The Council of Experts (Top-K Routing): We don't just send a token to one expert. The gating network picks the top k (e.g., 2) experts, and the token is processed by all of them. Their final outputs are then combined in a weighted average based on the gate's scores.
 
-    Top-K Routing: For each token, the gating network selects the top k experts, and their outputs are combined with a weighted sum.
-
-This allows the model to activate only a sparse subset of its weights for each token, leading to more efficient inference.
-How to Run
+This means for any given token, most of the model's parameters are completely ignored, which is the key to MoE's efficiency.
+Quick Start
 1. Compile
 
-You will need a C compiler (like gcc or clang). The -lm flag is required to link the math library. Using optimization flags like -O2 is highly recommended for performance.
+You'll need gcc or clang. We need the math library (-lm), and you'll really want optimizations (-O2), otherwise training might finish sometime next year.
 
 gcc -o moe moe.c -lm -O2
 
 2. Run
 
-Execute the compiled program from your terminal.
+Execute the compiled program. That's it.
 
 ./moe
 
-What to Expect
+The program will immediately start training on a small sample of Shakespeare.
+Training
 
-The program will start training immediately on a small sample of Shakespeare's text. You should see the following output:
+Unlike llama2.c which trains in Python and infers in C, this project handles the entire training process in C. The main() function is the training script.
 
-    Initialization: The model configuration and approximate parameter count will be printed.
+When you run ./moe, you will see the training loss printed every 50 steps. The most important sign that the universe is in order is that this loss value steadily decreases.
 
-    Training Progress: Every 50 steps, the current loss will be printed. The most important sign of success is watching this loss value steadily decrease.
+Step    0 | Loss: 4.1234 (Primary: 4.0123, Aux: 1.1111) | Best: 4.1234
+Step   50 | Loss: 3.5678 (Primary: 3.4567, Aux: 1.1111) | Best: 3.5678
+...
+Step  950 | Loss: 1.8765 (Primary: 1.7654, Aux: 1.1111) | Best: 1.8765
 
-    Step    0 | Loss: 4.1234 (Primary: 4.0123, Aux: 1.1111) | Best: 4.1234
-    Step   50 | Loss: 3.5678 (Primary: 3.4567, Aux: 1.1111) | Best: 3.5678
-    ...
+The Aux loss is the special "load balancing" loss that encourages the gating network to use all its experts, preventing it from getting lazy and only sending tokens to one favorite.
 
-    Expert Utilization: Periodically, the program will analyze and print how often each expert is being used. A healthy model will learn to distribute the workload across all experts.
+After training, a tinymoe.bin file containing the model weights will be saved to disk.
+Inference
 
-    Text Generation: After training is complete, the program will generate text from a few sample prompts.
+Once training is complete, the program will automatically demonstrate text generation from a few sample prompts. You can also modify main() to load the tinymoe.bin file and run inference directly.
 
-    Model Checkpoint: The final trained model weights will be saved to a file named tinymoe.bin.
-
-Future Work
-
-This project is a foundation. There are many exciting directions to take it:
-
-    Data Loaders: Implement a more robust data loader to train on larger text files.
-
-    Tokenizer: Integrate a more advanced tokenizer (like SentencePiece) instead of the simple character-level one.
-
-    Performance: Optimize the matrix multiplication and other hot paths with techniques like SIMD intrinsics.
-
-    GGUF Support: Add the capability to load quantized weights from popular MoE models like Mixtral.
-
-This project was created as a learning exercise and is heavily inspired by the work of Andrej Karpathy.
+This project was created as a learning exercise. It's a testament to the idea that to truly understand something, you should try to build it from scratch.
