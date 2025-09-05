@@ -1,17 +1,36 @@
 #include <stdio.h>
+#include <cblas.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h> // Add this at the top with other includes
+#include <sys/time.h>
 #include <omp.h>
-#define DEBUG 1
+#include <sys/time.h>
+#define DEBUG 0
 
 // ============================================================================
 // ## 1. ARCHITECTURE DEFINITION
 // ============================================================================
 
+typedef enum
+{
+    DATASET_TINYSHAKESPEARE,
+    DATASET_TINYSTORIES,
+    DATASET_CUSTOM
+} DatasetType;
+
+typedef struct
+{
+    float repetition_penalty;
+    int repetition_window;
+    float length_penalty;
+    int max_repetitions;
+    int min_tokens;
+    int stop_on_repeat;
+} GenerationConfig;
 // Configuration struct to hold all hyperparameters
 typedef struct
 {
@@ -24,6 +43,16 @@ typedef struct
     int top_k;       // number of experts to route to for each token (e.g., 2)
     int hidden_dim;  // hidden dimension for expert FFNs (e.g., 512)
 } Config;
+
+typedef struct
+{
+    float *losses;
+    float *val_losses;
+    float *perplexities;
+    int *steps;
+    int num_records;
+    int capacity;
+} TrainingHistory;
 
 // A single Feed-Forward Network (FFN), which will serve as an "Expert"
 typedef struct
@@ -76,6 +105,17 @@ typedef struct
     float *final_ln_gamma;    // final layer norm scale
     float *final_ln_beta;     // final layer norm shift
 } GPT2_MoE_Model;
+
+typedef struct
+{
+    char timestamp[32];
+    float best_loss;
+    int training_steps;
+    DatasetType dataset_type;
+    Config config;
+    float validation_loss;
+    float perplexity;
+} ModelMetadata;
 
 // Struct to hold the activations during the forward pass (the "state")
 typedef struct
@@ -219,19 +259,54 @@ typedef struct
     int size;
     int *tokens;
     int num_tokens;
-    char *vocab[256];
+    char **vocab;
     int vocab_size;
+    DatasetType type;
+    char *name;
+
+    // Training/validation split
+    int train_tokens;
+    int val_tokens;
+    int *train_data;
+    int *val_data;
+
+    // Tokenization type
+    int use_word_level; // 0 for char, 1 for word
 } Dataset;
+
+GenerationConfig create_generation_config(void);
+TrainingHistory *create_training_history(int capacity);
+char *generate_model_filename(const char *base_name, int step, float loss);
+void save_model_with_metadata(GPT2_MoE_Model *model, const char *filename, ModelMetadata *metadata);
+int load_model_with_metadata(GPT2_MoE_Model *model, const char *filename, ModelMetadata *metadata);
+void free_model(GPT2_MoE_Model *model);
+void free_state(RunState *state, Config *config);
+void free_dataset(Dataset *dataset);
+void free_optimizer(Optimizer *opt, Config *config);
+float validate_model(GPT2_MoE_Model *model, RunState *state, Dataset *dataset, Config *config);
+float calculate_perplexity(float *logits, int *targets, Config *config, int normalize);
+float get_adaptive_learning_rate(int step, int warmup, int total, float max_lr, float min_lr);
+void generate_training_sample(GPT2_MoE_Model *model, RunState *state, Dataset *dataset, Config *config, int step);
+void record_training_step(TrainingHistory *history, int step, float loss, float val_loss, float perplexity);
 
 // ============================================================================
 // ## FORWARD DECLARATIONS
 // ============================================================================
 void analyze_expert_usage(RunState *state, Config *config, int num_steps);
+void generate_text_enhanced(GPT2_MoE_Model *model, RunState *state, Dataset *dataset,
+                            const char *prompt, int max_tokens, float temperature,
+                            float top_p, GenerationConfig *gen_config);
 int load_model(GPT2_MoE_Model *model, const char *filename);
+int load_model_with_metadata(GPT2_MoE_Model *model, const char *filename,
+                             ModelMetadata *metadata);
 void save_model(GPT2_MoE_Model *model, const char *filename);
 void generate_text(GPT2_MoE_Model *model, RunState *state, Dataset *dataset,
-                   const char *prompt, int max_tokens, float temperature, float top_p);
-void free_model(GPT2_MoE_Model *model);
+                   const char *prompt, int max_tokens, float temperature, float top_p)
+{
+    GenerationConfig gen_config = create_generation_config();
+    generate_text_enhanced(model, state, dataset, prompt, max_tokens, temperature, top_p, &gen_config);
+}
+void record_training_step(TrainingHistory *history, int step, float loss, float val_loss, float perplexity);
 void free_state(RunState *state, Config *config);
 void free_dataset(Dataset *dataset);
 void free_optimizer(Optimizer *opt, Config *config);
@@ -239,6 +314,79 @@ void free_optimizer(Optimizer *opt, Config *config);
 // ============================================================================
 // ## 2. UTILITY FUNCTIONS
 // ============================================================================
+
+typedef struct
+{
+    float prob;
+    int index;
+} ProbIndex;
+static int cmp_prob_desc(const void *a, const void *b)
+{
+    float pa = ((const ProbIndex *)a)->prob;
+    float pb = ((const ProbIndex *)b)->prob;
+    return (pa > pb) ? -1 : (pa < pb);
+}
+
+char *generate_model_filename(const char *base_name, int step, float loss)
+{
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+
+    char *filename = malloc(256);
+    snprintf(filename, 256, "%s_step%d_loss%.4f_%04d%02d%02d_%02d%02d%02d.bin",
+             base_name,
+             step,
+             loss,
+             tm_info->tm_year + 1900,
+             tm_info->tm_mon + 1,
+             tm_info->tm_mday,
+             tm_info->tm_hour,
+             tm_info->tm_min,
+             tm_info->tm_sec);
+
+    return filename;
+}
+
+GenerationConfig create_generation_config()
+{
+    GenerationConfig config;
+    config.repetition_penalty = 1.1f;
+    config.repetition_window = 20;
+    config.length_penalty = 1.0f;
+    config.max_repetitions = 3;
+    config.min_tokens = 10;
+    config.stop_on_repeat = 1;
+    return config;
+}
+
+void download_dataset(const char *url, const char *filename)
+{
+    char command[512];
+    snprintf(command, sizeof(command), "curl -o %s %s", filename, url);
+    printf("Downloading %s...\n", filename);
+    if (system(command) != 0)
+    {
+        printf("Failed to download. Trying wget...\n");
+        snprintf(command, sizeof(command), "wget -O %s %s", filename, url);
+        if (system(command) != 0)
+        {
+            printf("Download failed. Please download manually.\n");
+            exit(1);
+        }
+    }
+    printf("✓ Downloaded %s\n", filename);
+}
+
+int file_exists(const char *filename)
+{
+    FILE *file = fopen(filename, "r");
+    if (file)
+    {
+        fclose(file);
+        return 1;
+    }
+    return 0;
+}
 
 // Random number generator
 float randn()
@@ -279,52 +427,33 @@ void softmax(float *x, int size)
     if (size <= 0)
         return;
 
-    // Find maximum value for numerical stability
+    /* 1.  Global max (single-threaded is faster for small arrays) */
     float max_val = x[0];
-#pragma omp parallel for
-    for (int i = 1; i < size; i++)
-    {
-#pragma omp critical
+    for (int i = 1; i < size; ++i)
         if (x[i] > max_val)
             max_val = x[i];
-    }
 
-    // Compute exponentials and sum
+    /* 2.  Clamp inputs *before* expf */
     float sum = 0.0f;
-#pragma omp parallel for reduction(+ : sum)
-    for (int i = 0; i < size; i++)
+    for (int i = 0; i < size; ++i)
     {
-        x[i] = expf(x[i] - max_val);
-        // Handle potential NaN/inf values
-        if (!isfinite(x[i]) || x[i] < 0.0f)
-            x[i] = 1e-8f;
-        sum += x[i];
+        float z = fminf(fmaxf(x[i] - max_val, -50.0f), 50.0f); /* clamp */
+        float e = expf(z);
+        x[i] = e;
+        sum += e;
     }
 
-    // Normalize with safety check
+    /* 3.  Normalize safely */
     if (sum < 1e-8f)
     {
-        // If sum is too small, use uniform distribution
-        float uniform_val = 1.0f / size;
-#pragma omp parallel for
-        for (int i = 0; i < size; i++)
-        {
-            x[i] = uniform_val;
-        }
+        float uniform = 1.0f / size;
+        for (int i = 0; i < size; ++i)
+            x[i] = uniform;
     }
     else
     {
-// Normal softmax normalization
-#pragma omp parallel for
-        for (int i = 0; i < size; i++)
-        {
+        for (int i = 0; i < size; ++i)
             x[i] /= sum;
-            // Clamp to prevent extreme values
-            if (x[i] < 1e-8f)
-                x[i] = 1e-8f;
-            if (x[i] > 1.0f)
-                x[i] = 1.0f;
-        }
     }
 }
 // Layer normalization
@@ -360,19 +489,30 @@ void layer_norm(float *out, float *x, float *gamma, float *beta, int size)
 // Matrix multiplication: C = A * B^T
 void matmul(float *c, float *a, float *b, int n, int d, int k)
 {
-#pragma omp parallel for
-    for (int i = 0; i < n; i++)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                n, k, d, 1.0f, a, d, b, d, 0.0f, c, k);
+}
+
+TrainingHistory *create_training_history(int capacity)
+{
+    TrainingHistory *history = malloc(sizeof(TrainingHistory));
+    if (!history)
     {
-        for (int j = 0; j < k; j++)
-        {
-            float sum = 0.0f;
-            for (int l = 0; l < d; l++)
-            {
-                sum += a[i * d + l] * b[j * d + l];
-            }
-            c[i * k + j] = sum;
-        }
+        fprintf(stderr, "Failed to allocate TrainingHistory\n");
+        exit(1);
     }
+    history->losses = malloc(capacity * sizeof(float));
+    history->val_losses = malloc(capacity * sizeof(float));
+    history->perplexities = malloc(capacity * sizeof(float));
+    history->steps = malloc(capacity * sizeof(int));
+    if (!history->losses || !history->val_losses || !history->perplexities || !history->steps)
+    {
+        fprintf(stderr, "Failed to allocate TrainingHistory buffers\n");
+        exit(1);
+    }
+    history->num_records = 0;
+    history->capacity = capacity;
+    return history;
 }
 
 // Add bias
@@ -630,542 +770,104 @@ void build_model(GPT2_MoE_Model *model, Config *config)
 
 void build_state(RunState *state, Config *config)
 {
-    // Add null pointer checks for all memory allocations
-    state->embedding_out = malloc(config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->embedding_out)
-    {
-        printf("Failed to allocate embedding_out\n");
-        exit(1);
-    }
+    int seq_len = config->seq_len;
+    int embed_dim = config->embed_dim;
+    int num_layers = config->num_layers;
+    int num_experts = config->num_experts;
+    int top_k = config->top_k;
+    int hidden_dim = config->hidden_dim;
 
-    state->layer_outputs = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->layer_outputs)
-    {
-        printf("Failed to allocate layer_outputs\n");
-        exit(1);
-    }
+    /* -----  forward & backward buffers allocated once  ----- */
+    state->embedding_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->layer_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->attn_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->moe_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->logits = calloc(seq_len * config->vocab_size, sizeof(float));
+    state->gating_logits = calloc(num_layers * seq_len * num_experts, sizeof(float));
+    state->expert_indices = calloc(num_layers * seq_len * top_k, sizeof(int));
+    state->expert_weights = calloc(num_layers * seq_len * top_k, sizeof(float));
+    state->expert_outputs = calloc(num_layers * num_experts * seq_len * embed_dim, sizeof(float));
+    state->temp_buffer = calloc(seq_len * embed_dim, sizeof(float));
+    state->temp_buffer2 = calloc(seq_len * embed_dim, sizeof(float));
+    state->gating_scores_buffer = calloc(num_experts, sizeof(float));
+    state->hidden_buffer = calloc(hidden_dim, sizeof(float));
+    state->expert_out_buffer = calloc(embed_dim, sizeof(float));
+    state->attention_scores_buffer = calloc(seq_len * seq_len, sizeof(float));
+    state->qkv_buffer = calloc(seq_len * 3 * embed_dim, sizeof(float));
+    state->ln1_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->ln2_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->attn_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->attn_residual = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->moe_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->gating_scores = calloc(num_layers * seq_len * num_experts, sizeof(float));
+    state->expert_hiddens = calloc(num_layers * num_experts * seq_len * hidden_dim, sizeof(float));
+    state->attn_concat = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->attention_probs = calloc(num_layers * seq_len * seq_len, sizeof(float));
 
-    state->attn_out = malloc(config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->attn_out)
-    {
-        printf("Failed to allocate attn_out\n");
-        exit(1);
-    }
+    /* -----  gradient buffers allocated once  ----- */
+    state->d_embedding_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_layer_outputs = calloc(num_layers * seq_len * embed_dim, sizeof(float));
+    state->d_attn_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_moe_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_temp_buffer = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_temp_buffer2 = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_token_embeddings = calloc(config->vocab_size * embed_dim, sizeof(float));
+    state->d_pos_embeddings = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_final_ln_gamma = calloc(embed_dim, sizeof(float));
+    state->d_final_ln_beta = calloc(embed_dim, sizeof(float));
 
-    state->moe_out = malloc(config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->moe_out)
-    {
-        printf("Failed to allocate moe_out\n");
-        exit(1);
-    }
+    /* -----  per-layer gradient arrays  ----- */
+    state->d_attn_qkv_w = calloc(num_layers, sizeof(float *));
+    state->d_attn_qkv_b = calloc(num_layers, sizeof(float *));
+    state->d_attn_proj_w = calloc(num_layers, sizeof(float *));
+    state->d_attn_proj_b = calloc(num_layers, sizeof(float *));
+    state->d_ln1_gamma = calloc(num_layers, sizeof(float *));
+    state->d_ln1_beta = calloc(num_layers, sizeof(float *));
+    state->d_ln2_gamma = calloc(num_layers, sizeof(float *));
+    state->d_ln2_beta = calloc(num_layers, sizeof(float *));
+    state->d_gating_w = calloc(num_layers, sizeof(float *));
+    state->d_gating_b = calloc(num_layers, sizeof(float *));
+    state->d_expert_w1 = calloc(num_layers, sizeof(float **));
+    state->d_expert_b1 = calloc(num_layers, sizeof(float **));
+    state->d_expert_w2 = calloc(num_layers, sizeof(float **));
+    state->d_expert_b2 = calloc(num_layers, sizeof(float **));
 
-    state->attention_probs = malloc(config->num_layers * config->seq_len * config->seq_len * sizeof(float));
-    if (!state->attention_probs)
-    {
-        printf("Failed to allocate attention_probs\n");
-        exit(1);
-    }
+    /* -----  scratch buffers reused by every layer  ----- */
+    state->d_ln1_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_ln2_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_attn_residual_out = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_attn_concat = calloc(seq_len * embed_dim, sizeof(float));
+    state->d_attention_scores = calloc(seq_len * seq_len, sizeof(float));
+    state->d_query = calloc(seq_len * (embed_dim / config->num_heads), sizeof(float));
+    state->d_key = calloc(seq_len * (embed_dim / config->num_heads), sizeof(float));
+    state->d_value = calloc(seq_len * (embed_dim / config->num_heads), sizeof(float));
+    state->d_softmax_scores = calloc(seq_len * seq_len, sizeof(float));
 
-    state->logits = malloc(config->seq_len * config->vocab_size * sizeof(float));
-    if (!state->logits)
+    /* -----  allocate per-layer parameter gradients  ----- */
+    for (int l = 0; l < num_layers; l++)
     {
-        printf("Failed to allocate logits\n");
-        exit(1);
-    }
+        state->d_attn_qkv_w[l] = calloc(embed_dim * 3 * embed_dim, sizeof(float));
+        state->d_attn_qkv_b[l] = calloc(3 * embed_dim, sizeof(float));
+        state->d_attn_proj_w[l] = calloc(embed_dim * embed_dim, sizeof(float));
+        state->d_attn_proj_b[l] = calloc(embed_dim, sizeof(float));
+        state->d_ln1_gamma[l] = calloc(embed_dim, sizeof(float));
+        state->d_ln1_beta[l] = calloc(embed_dim, sizeof(float));
+        state->d_ln2_gamma[l] = calloc(embed_dim, sizeof(float));
+        state->d_ln2_beta[l] = calloc(embed_dim, sizeof(float));
+        state->d_gating_w[l] = calloc(embed_dim * num_experts, sizeof(float));
+        state->d_gating_b[l] = calloc(num_experts, sizeof(float));
 
-    state->gating_logits = malloc(config->num_layers * config->seq_len * config->num_experts * sizeof(float));
-    if (!state->gating_logits)
-    {
-        printf("Failed to allocate gating_logits\n");
-        exit(1);
-    }
+        state->d_expert_w1[l] = calloc(num_experts, sizeof(float *));
+        state->d_expert_b1[l] = calloc(num_experts, sizeof(float *));
+        state->d_expert_w2[l] = calloc(num_experts, sizeof(float *));
+        state->d_expert_b2[l] = calloc(num_experts, sizeof(float *));
 
-    state->expert_indices = malloc(config->num_layers * config->seq_len * config->top_k * sizeof(int));
-    if (!state->expert_indices)
-    {
-        printf("Failed to allocate expert_indices\n");
-        exit(1);
-    }
-
-    state->expert_weights = malloc(config->num_layers * config->seq_len * config->top_k * sizeof(float));
-    if (!state->expert_weights)
-    {
-        printf("Failed to allocate expert_weights\n");
-        exit(1);
-    }
-
-    state->expert_outputs = malloc(config->num_layers * config->num_experts * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->expert_outputs)
-    {
-        printf("Failed to allocate expert_outputs\n");
-        exit(1);
-    }
-
-    state->temp_buffer = malloc(config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->temp_buffer)
-    {
-        printf("Failed to allocate temp_buffer\n");
-        exit(1);
-    }
-
-    state->temp_buffer2 = malloc(config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->temp_buffer2)
-    {
-        printf("Failed to allocate temp_buffer2\n");
-        exit(1);
-    }
-
-    state->gating_scores_buffer = malloc(config->num_experts * sizeof(float));
-    if (!state->gating_scores_buffer)
-    {
-        printf("Failed to allocate gating_scores_buffer\n");
-        exit(1);
-    }
-
-    state->hidden_buffer = malloc(config->hidden_dim * sizeof(float));
-    if (!state->hidden_buffer)
-    {
-        printf("Failed to allocate hidden_buffer\n");
-        exit(1);
-    }
-
-    state->expert_out_buffer = malloc(config->embed_dim * sizeof(float));
-    if (!state->expert_out_buffer)
-    {
-        printf("Failed to allocate expert_out_buffer\n");
-        exit(1);
-    }
-
-    state->attention_scores_buffer = malloc(config->seq_len * config->seq_len * sizeof(float));
-    if (!state->attention_scores_buffer)
-    {
-        printf("Failed to allocate attention_scores_buffer\n");
-        exit(1);
-    }
-
-    state->qkv_buffer = malloc(config->seq_len * 3 * config->embed_dim * sizeof(float));
-    if (!state->qkv_buffer)
-    {
-        printf("Failed to allocate qkv_buffer\n");
-        exit(1);
-    }
-
-    state->ln1_outputs = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->ln1_outputs)
-    {
-        printf("Failed to allocate ln1_outputs\n");
-        exit(1);
-    }
-
-    state->ln2_outputs = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->ln2_outputs)
-    {
-        printf("Failed to allocate ln2_outputs\n");
-        exit(1);
-    }
-
-    state->attn_outputs = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->attn_outputs)
-    {
-        printf("Failed to allocate attn_outputs\n");
-        exit(1);
-    }
-
-    state->attn_residual = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->attn_residual)
-    {
-        printf("Failed to allocate attn_residual\n");
-        exit(1);
-    }
-
-    state->moe_outputs = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->moe_outputs)
-    {
-        printf("Failed to allocate moe_outputs\n");
-        exit(1);
-    }
-
-    state->gating_scores = malloc(config->num_layers * config->seq_len * config->num_experts * sizeof(float));
-    if (!state->gating_scores)
-    {
-        printf("Failed to allocate gating_scores\n");
-        exit(1);
-    }
-
-    state->expert_hiddens = malloc(config->num_layers * config->num_experts * config->seq_len * config->hidden_dim * sizeof(float));
-    if (!state->expert_hiddens)
-    {
-        printf("Failed to allocate expert_hiddens\n");
-        exit(1);
-    }
-
-    state->attn_concat = malloc(config->num_layers * config->seq_len * config->embed_dim * sizeof(float));
-    if (!state->attn_concat)
-    {
-        printf("Failed to allocate attn_concat\n");
-        exit(1);
-    }
-
-    state->d_embedding_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_embedding_out)
-    {
-        printf("Failed to allocate d_embedding_out\n");
-        exit(1);
-    }
-
-    state->d_layer_outputs = calloc(config->num_layers * config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_layer_outputs)
-    {
-        printf("Failed to allocate d_layer_outputs\n");
-        exit(1);
-    }
-
-    state->d_attn_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_attn_out)
-    {
-        printf("Failed to allocate d_attn_out\n");
-        exit(1);
-    }
-
-    state->d_moe_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_moe_out)
-    {
-        printf("Failed to allocate d_moe_out\n");
-        exit(1);
-    }
-
-    state->d_temp_buffer = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_temp_buffer)
-    {
-        printf("Failed to allocate d_temp_buffer\n");
-        exit(1);
-    }
-
-    state->d_temp_buffer2 = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_temp_buffer2)
-    {
-        printf("Failed to allocate d_temp_buffer2\n");
-        exit(1);
-    }
-
-    state->d_token_embeddings = calloc(config->vocab_size * config->embed_dim, sizeof(float));
-    if (!state->d_token_embeddings)
-    {
-        printf("Failed to allocate d_token_embeddings\n");
-        exit(1);
-    }
-
-    state->d_pos_embeddings = calloc(config->seq_len * config->embed_dim, sizeof(float));
-    if (!state->d_pos_embeddings)
-    {
-        printf("Failed to allocate d_pos_embeddings\n");
-        exit(1);
-    }
-
-    state->d_final_ln_gamma = calloc(config->embed_dim, sizeof(float));
-    if (!state->d_final_ln_gamma)
-    {
-        printf("Failed to allocate d_final_ln_gamma\n");
-        exit(1);
-    }
-
-    state->d_final_ln_beta = calloc(config->embed_dim, sizeof(float));
-    if (!state->d_final_ln_beta)
-    {
-        printf("Failed to allocate d_final_ln_beta\n");
-        exit(1);
-    }
-
-    state->d_attn_qkv_w = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_attn_qkv_w)
-    {
-        printf("Failed to allocate d_attn_qkv_w\n");
-        exit(1);
-    }
-
-    state->d_attn_qkv_b = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_attn_qkv_b)
-    {
-        printf("Failed to allocate d_attn_qkv_b\n");
-        exit(1);
-    }
-
-    state->d_attn_proj_w = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_attn_proj_w)
-    {
-        printf("Failed to allocate d_attn_proj_w\n");
-        exit(1);
-    }
-
-    state->d_attn_proj_b = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_attn_proj_b)
-    {
-        printf("Failed to allocate d_attn_proj_b\n");
-        exit(1);
-    }
-
-    state->d_ln1_gamma = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_ln1_gamma)
-    {
-        printf("Failed to allocate d_ln1_gamma\n");
-        exit(1);
-    }
-
-    state->d_ln1_beta = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_ln1_beta)
-    {
-        printf("Failed to allocate d_ln1_beta\n");
-        exit(1);
-    }
-
-    state->d_ln2_gamma = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_ln2_gamma)
-    {
-        printf("Failed to allocate d_ln2_gamma\n");
-        exit(1);
-    }
-
-    state->d_ln2_beta = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_ln2_beta)
-    {
-        printf("Failed to allocate d_ln2_beta\n");
-        exit(1);
-    }
-
-    state->d_gating_w = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_gating_w)
-    {
-        printf("Failed to allocate d_gating_w\n");
-        exit(1);
-    }
-
-    state->d_gating_b = malloc(config->num_layers * sizeof(float *));
-    if (!state->d_gating_b)
-    {
-        printf("Failed to allocate d_gating_b\n");
-        exit(1);
-    }
-
-    state->d_expert_w1 = malloc(config->num_layers * sizeof(float **));
-    if (!state->d_expert_w1)
-    {
-        printf("Failed to allocate d_expert_w1\n");
-        exit(1);
-    }
-
-    state->d_expert_b1 = malloc(config->num_layers * sizeof(float **));
-    if (!state->d_expert_b1)
-    {
-        printf("Failed to allocate d_expert_b1\n");
-        exit(1);
-    }
-
-    state->d_expert_w2 = malloc(config->num_layers * sizeof(float **));
-    if (!state->d_expert_w2)
-    {
-        printf("Failed to allocate d_expert_w2\n");
-        exit(1);
-    }
-
-    state->d_expert_b2 = malloc(config->num_layers * sizeof(float **));
-    if (!state->d_expert_b2)
-    {
-        printf("Failed to allocate d_expert_b2\n");
-        exit(1);
-    }
-
-    for (int l = 0; l < config->num_layers; l++)
-    {
-        state->d_attn_qkv_w[l] = calloc(config->embed_dim * 3 * config->embed_dim, sizeof(float));
-        if (!state->d_attn_qkv_w[l])
+        for (int e = 0; e < num_experts; e++)
         {
-            printf("Failed to allocate d_attn_qkv_w[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_attn_qkv_b[l] = calloc(3 * config->embed_dim, sizeof(float));
-        if (!state->d_attn_qkv_b[l])
-        {
-            printf("Failed to allocate d_attn_qkv_b[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_attn_proj_w[l] = calloc(config->embed_dim * config->embed_dim, sizeof(float));
-        if (!state->d_attn_proj_w[l])
-        {
-            printf("Failed to allocate d_attn_proj_w[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_attn_proj_b[l] = calloc(config->embed_dim, sizeof(float));
-        if (!state->d_attn_proj_b[l])
-        {
-            printf("Failed to allocate d_attn_proj_b[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_ln1_gamma[l] = calloc(config->embed_dim, sizeof(float));
-        if (!state->d_ln1_gamma[l])
-        {
-            printf("Failed to allocate d_ln1_gamma[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_ln1_beta[l] = calloc(config->embed_dim, sizeof(float));
-        if (!state->d_ln1_beta[l])
-        {
-            printf("Failed to allocate d_ln1_beta[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_ln2_gamma[l] = calloc(config->embed_dim, sizeof(float));
-        if (!state->d_ln2_gamma[l])
-        {
-            printf("Failed to allocate d_ln2_gamma[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_ln2_beta[l] = calloc(config->embed_dim, sizeof(float));
-        if (!state->d_ln2_beta[l])
-        {
-            printf("Failed to allocate d_ln2_beta[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_gating_w[l] = calloc(config->embed_dim * config->num_experts, sizeof(float));
-        if (!state->d_gating_w[l])
-        {
-            printf("Failed to allocate d_gating_w[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_gating_b[l] = calloc(config->num_experts, sizeof(float));
-        if (!state->d_gating_b[l])
-        {
-            printf("Failed to allocate d_gating_b[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_expert_w1[l] = malloc(config->num_experts * sizeof(float *));
-        if (!state->d_expert_w1[l])
-        {
-            printf("Failed to allocate d_expert_w1[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_expert_b1[l] = malloc(config->num_experts * sizeof(float *));
-        if (!state->d_expert_b1[l])
-        {
-            printf("Failed to allocate d_expert_b1[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_expert_w2[l] = malloc(config->num_experts * sizeof(float *));
-        if (!state->d_expert_w2[l])
-        {
-            printf("Failed to allocate d_expert_w2[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_expert_b2[l] = malloc(config->num_experts * sizeof(float *));
-        if (!state->d_expert_b2[l])
-        {
-            printf("Failed to allocate d_expert_b2[%d]\n", l);
-            exit(1);
-        }
-
-        state->d_ln1_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-        if (!state->d_ln1_out)
-        {
-            printf("Failed to allocate d_ln1_out\n");
-            exit(1);
-        }
-
-        state->d_ln2_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-        if (!state->d_ln2_out)
-        {
-            printf("Failed to allocate d_ln2_out\n");
-            exit(1);
-        }
-
-        state->d_attn_residual_out = calloc(config->seq_len * config->embed_dim, sizeof(float));
-        if (!state->d_attn_residual_out)
-        {
-            printf("Failed to allocate d_attn_residual_out\n");
-            exit(1);
-        }
-
-        state->d_attn_concat = calloc(config->seq_len * config->embed_dim, sizeof(float));
-        if (!state->d_attn_concat)
-        {
-            printf("Failed to allocate d_attn_concat\n");
-            exit(1);
-        }
-
-        state->d_attention_scores = calloc(config->seq_len * config->seq_len, sizeof(float));
-        if (!state->d_attention_scores)
-        {
-            printf("Failed to allocate d_attention_scores\n");
-            exit(1);
-        }
-
-        state->d_query = calloc(config->seq_len * (config->embed_dim / config->num_heads), sizeof(float));
-        if (!state->d_query)
-        {
-            printf("Failed to allocate d_query\n");
-            exit(1);
-        }
-
-        state->d_key = calloc(config->seq_len * (config->embed_dim / config->num_heads), sizeof(float));
-        if (!state->d_key)
-        {
-            printf("Failed to allocate d_key\n");
-            exit(1);
-        }
-
-        state->d_value = calloc(config->seq_len * (config->embed_dim / config->num_heads), sizeof(float));
-        if (!state->d_value)
-        {
-            printf("Failed to allocate d_value\n");
-            exit(1);
-        }
-
-        state->d_softmax_scores = calloc(config->seq_len * config->seq_len, sizeof(float));
-        if (!state->d_softmax_scores)
-        {
-            printf("Failed to allocate d_softmax_scores\n");
-            exit(1);
-        }
-
-        for (int e = 0; e < config->num_experts; e++)
-        {
-            state->d_expert_w1[l][e] = calloc(config->embed_dim * config->hidden_dim, sizeof(float));
-            if (!state->d_expert_w1[l][e])
-            {
-                printf("Failed to allocate d_expert_w1[%d][%d]\n", l, e);
-                exit(1);
-            }
-
-            state->d_expert_b1[l][e] = calloc(config->hidden_dim, sizeof(float));
-            if (!state->d_expert_b1[l][e])
-            {
-                printf("Failed to allocate d_expert_b1[%d][%d]\n", l, e);
-                exit(1);
-            }
-
-            state->d_expert_w2[l][e] = calloc(config->hidden_dim * config->embed_dim, sizeof(float));
-            if (!state->d_expert_w2[l][e])
-            {
-                printf("Failed to allocate d_expert_w2[%d][%d]\n", l, e);
-                exit(1);
-            }
-
-            state->d_expert_b2[l][e] = calloc(config->embed_dim, sizeof(float));
-            if (!state->d_expert_b2[l][e])
-            {
-                printf("Failed to allocate d_expert_b2[%d][%d]\n", l, e);
-                exit(1);
-            }
+            state->d_expert_w1[l][e] = calloc(embed_dim * hidden_dim, sizeof(float));
+            state->d_expert_b1[l][e] = calloc(hidden_dim, sizeof(float));
+            state->d_expert_w2[l][e] = calloc(hidden_dim * embed_dim, sizeof(float));
+            state->d_expert_b2[l][e] = calloc(embed_dim, sizeof(float));
         }
     }
 }
@@ -1271,7 +973,8 @@ void update_weights(GPT2_MoE_Model *model, RunState *state, Optimizer *opt, floa
 // ## 4. FORWARD PASS IMPLEMENTATION
 // ============================================================================
 
-void multi_head_attention(float *out, float *x, TransformerBlock *layer, Config *config, RunState *state, int layer_idx)
+void multi_head_attention(float *out, float *x, TransformerBlock *layer,
+                          Config *config, RunState *state, int layer_idx)
 {
     if (DEBUG)
         printf("  Multi-head attention\n");
@@ -1282,41 +985,56 @@ void multi_head_attention(float *out, float *x, TransformerBlock *layer, Config 
     int head_dim = embed_dim / num_heads;
 
     float *qkv = state->qkv_buffer;
+    memset(qkv, 0, seq_len * 3 * embed_dim * sizeof(float));
 
-    // Compute QKV for all positions
+    /* ----  FUSED: LayerNorm + QKV projection  ---- */
+#pragma omp parallel for
     for (int t = 0; t < seq_len; t++)
     {
+        /* LayerNorm in-register */
+        float mean = 0.0f, var = 0.0f;
+        for (int d = 0; d < embed_dim; d++)
+            mean += x[t * embed_dim + d];
+        mean /= embed_dim;
+        for (int d = 0; d < embed_dim; d++)
+        {
+            float diff = x[t * embed_dim + d] - mean;
+            var += diff * diff;
+        }
+        var /= embed_dim;
+        float rstd = 1.0f / sqrtf(var + 1e-5f);
+
+        /* QKV projection using normalized x */
         for (int d = 0; d < 3 * embed_dim; d++)
         {
-            qkv[t * 3 * embed_dim + d] = layer->attn_qkv_b[d];
+            float sum = layer->attn_qkv_b[d];
             for (int e = 0; e < embed_dim; e++)
             {
-                qkv[t * 3 * embed_dim + d] += x[t * embed_dim + e] * layer->attn_qkv_w[e * 3 * embed_dim + d];
+                float val = (x[t * embed_dim + e] - mean) * rstd *
+                                layer->ln1_gamma[e] +
+                            layer->ln1_beta[e];
+                sum += val * layer->attn_qkv_w[e * 3 * embed_dim + d];
             }
+            qkv[t * 3 * embed_dim + d] = sum;
         }
     }
 
-    // Initialize output
+    /* ----  rest of attention unchanged  ---- */
     memset(out, 0, seq_len * embed_dim * sizeof(float));
 
-    // Process each attention head
     for (int h = 0; h < num_heads; h++)
     {
-        // Compute attention for this head
         for (int i = 0; i < seq_len; i++)
         {
-            // Compute attention scores for position i
             for (int j = 0; j < seq_len; j++)
             {
                 if (j > i)
                 {
-                    // Causal masking
                     state->attention_scores_buffer[i * seq_len + j] = -1e9f;
                 }
                 else
                 {
                     float score = 0.0f;
-                    // Compute Q*K^T for this head
                     for (int d = 0; d < head_dim; d++)
                     {
                         float qi = qkv[i * 3 * embed_dim + h * head_dim + d];
@@ -1327,19 +1045,11 @@ void multi_head_attention(float *out, float *x, TransformerBlock *layer, Config 
                     state->attention_scores_buffer[i * seq_len + j] = score;
                 }
             }
-
-            // Apply softmax to row i
             float *row = &state->attention_scores_buffer[i * seq_len];
             softmax(row, seq_len);
-
-            // Save probabilities for backpropagation
             int prob_offset = (layer_idx * seq_len * seq_len) + (i * seq_len);
-            for (int j = 0; j < seq_len; j++)
-            {
-                state->attention_probs[prob_offset + j] = row[j];
-            }
+            memcpy(&state->attention_probs[prob_offset], row, seq_len * sizeof(float));
 
-            // Compute weighted sum for this head
             for (int d = 0; d < head_dim; d++)
             {
                 float sum = 0.0f;
@@ -1355,16 +1065,15 @@ void multi_head_attention(float *out, float *x, TransformerBlock *layer, Config 
 
     memcpy(state->attn_concat, state->temp_buffer, seq_len * embed_dim * sizeof(float));
 
-    // Output projection
+    /* output projection (unchanged) */
     for (int t = 0; t < seq_len; t++)
     {
         for (int d = 0; d < embed_dim; d++)
         {
             out[t * embed_dim + d] = layer->attn_proj_b[d];
             for (int e = 0; e < embed_dim; e++)
-            {
-                out[t * embed_dim + d] += state->temp_buffer[t * embed_dim + e] * layer->attn_proj_w[e * embed_dim + d];
-            }
+                out[t * embed_dim + d] +=
+                    state->temp_buffer[t * embed_dim + e] * layer->attn_proj_w[e * embed_dim + d];
         }
     }
 
@@ -1854,18 +1563,20 @@ void backward_pass(GPT2_MoE_Model *model, RunState *state, int *inputs, int *tar
                 }
 
                 // Softmax gradient for gating network
+                /* ----------  exact Jacobian-vector product for softmax  ---------- */
+                float *probs = state->gating_scores_buffer; // already softmax-normalised
+                float sum = 0.0f;
+                for (int e = 0; e < config->num_experts; e++)
+                    sum += probs[e] * d_weight;
+
                 for (int e = 0; e < config->num_experts; e++)
                 {
-                    float grad_contribution = d_weight * gating_scores[e];
-                    if (e == expert_idx)
-                        grad_contribution -= d_weight;
-
-                    state->d_gating_b[l][e] += grad_contribution; // FIXED: Removed division by top_k
-
+                    float grad = probs[e] * (d_weight - sum);
+                    state->d_gating_b[l][e] += grad;
                     for (int d2 = 0; d2 < embed_dim; d2++)
                     {
-                        state->d_gating_w[l][e * embed_dim + d2] += grad_contribution * ln2_token_out[d2];                  // FIXED: Removed division by top_k
-                        d_ln2_out[t * embed_dim + d2] += grad_contribution * layer->moe_layer.gating_w[e * embed_dim + d2]; // FIXED: Removed division by top_k
+                        state->d_gating_w[l][e * embed_dim + d2] += grad * ln2_token_out[d2];
+                        d_ln2_out[t * embed_dim + d2] += grad * layer->moe_layer.gating_w[e * embed_dim + d2];
                     }
                 }
             }
@@ -1921,142 +1632,134 @@ void backward_pass(GPT2_MoE_Model *model, RunState *state, int *inputs, int *tar
         memcpy(d_attn_out, d_attn_residual_out2, seq_len * embed_dim * sizeof(float));
         memcpy(d_ln1_out, d_attn_residual_out2, seq_len * embed_dim * sizeof(float));
 
-        // 4e. Backward through Multi-Head Attention (FULL IMPLEMENTATION)
-        float *d_ln1_out2 = state->d_temp_buffer2; // Use pre-allocated buffer
+        // 4e. Backward through Multi-Head Attention (Jacobian-vector product)
+        float *d_attn_concat = state->d_temp_buffer; // gradient w.r.t concatenated heads
+        float *d_ln1_out2 = state->d_temp_buffer2;   // gradient w.r.t ln1 output
+        memset(d_attn_concat, 0, seq_len * embed_dim * sizeof(float));
         memset(d_ln1_out2, 0, seq_len * embed_dim * sizeof(float));
 
-        // Get attention intermediate buffers
-        float *qkv_buffer = state->qkv_buffer;
-        float *attention_probs = state->attention_scores_buffer; // This now contains probabilities
-        float *attn_concat = state->attn_concat;                 // This should store concatenated head outputs
-
-        // Backward through output projection
-        float *d_attn_concat = state->d_temp_buffer; // Use pre-allocated buffer
-        memset(d_attn_concat, 0, seq_len * embed_dim * sizeof(float));
-
-        // Gradient w.r.t. output projection weights and bias
+        // --- 1. Gradient through output projection
         for (int t = 0; t < seq_len; t++)
         {
             for (int d = 0; d < embed_dim; d++)
             {
-                // Gradient w.r.t. output projection bias
                 state->d_attn_proj_b[l][d] += d_attn_out[t * embed_dim + d];
-
-                // Gradient w.r.t. output projection weights
                 for (int e = 0; e < embed_dim; e++)
                 {
-                    state->d_attn_proj_w[l][e * embed_dim + d] += d_attn_out[t * embed_dim + d] * attn_concat[l * seq_len * embed_dim + t * embed_dim + e];
-                    d_attn_concat[t * embed_dim + e] += d_attn_out[t * embed_dim + d] * layer->attn_proj_w[e * embed_dim + d];
+                    state->d_attn_proj_w[l][e * embed_dim + d] +=
+                        d_attn_out[t * embed_dim + d] * state->attn_concat[t * embed_dim + e];
+                    d_attn_concat[t * embed_dim + e] +=
+                        d_attn_out[t * embed_dim + d] * layer->attn_proj_w[e * embed_dim + d];
                 }
             }
         }
 
-        // Backward through multi-head attention mechanism
+        // --- 2. Split gradient across heads
         for (int h = 0; h < num_heads; h++)
         {
             int head_offset = h * head_dim;
 
-            // Backward through attention output (weighted sum of values)
-            float *d_attention_scores = state->d_temp_buffer2; // Use pre-allocated buffer
-            float *d_value = state->d_temp_buffer;             // Use pre-allocated buffer
-            memset(d_attention_scores, 0, seq_len * seq_len * sizeof(float));
-            memset(d_value, 0, seq_len * head_dim * sizeof(float));
+            // --- 3. Compute gradient w.r.t attention probabilities (d_probs)
+            float *d_probs = state->d_temp_buffer2; // seq_len * seq_len
+            memset(d_probs, 0, seq_len * seq_len * sizeof(float));
 
             for (int i = 0; i < seq_len; i++)
             {
-                for (int j = 0; j <= i; j++) // Causal mask
+                float *probs = &state->attention_probs[(l * seq_len + i) * seq_len];
+                for (int j = 0; j <= i; j++)
                 {
-                    // Gradient w.r.t. attention scores (FIXED: Using probabilities instead of logits)
+                    float dot = 0.0f;
                     for (int d = 0; d < head_dim; d++)
                     {
                         int concat_idx = i * embed_dim + head_offset + d;
-                        d_attention_scores[i * seq_len + j] += d_attn_concat[concat_idx] *
-                                                               qkv_buffer[j * 3 * embed_dim + 2 * embed_dim + head_offset + d];
-
-                        // Gradient w.r.t. values
-                        d_value[j * head_dim + d] += d_attn_concat[concat_idx] * attention_probs[i * seq_len + j];
+                        float v_j = state->qkv_buffer[j * 3 * embed_dim + 2 * embed_dim + head_offset + d];
+                        dot += d_attn_concat[concat_idx] * v_j;
                     }
+                    d_probs[i * seq_len + j] = dot;
                 }
             }
 
-            // Backward through softmax (FIXED: Correct softmax gradient implementation)
-            float *d_softmax_scores = state->d_softmax_scores; // Use pre-allocated buffer
-            memset(d_softmax_scores, 0, seq_len * seq_len * sizeof(float));
-
-            // Get the saved probabilities for this layer and head
-            int prob_base_offset = l * seq_len * seq_len; // Layer offset
+            // --- 4. Backward through softmax (Jacobian-vector product)
+            float *d_scores = state->d_temp_buffer; // seq_len * seq_len
+            memset(d_scores, 0, seq_len * seq_len * sizeof(float));
 
             for (int i = 0; i < seq_len; i++)
             {
-                // Get probabilities for this query position
-                float *probs = &state->attention_probs[prob_base_offset + i * seq_len];
-
-                // Compute gradient of softmax: J[i,j] = p[i] * (delta[i,j] - p[j]) * grad_out[i]
-                for (int j = 0; j <= i; j++) // Only process valid positions due to causal mask
+                float *probs = &state->attention_probs[(l * seq_len + i) * seq_len];
+                float sum = 0.0f;
+                for (int j = 0; j <= i; j++)
                 {
-                    float p_i = probs[i];
-                    float p_j = probs[j];
-
-                    // Jacobian of softmax: J[i,j] = p[i] * (delta[i,j] - p[j])
-                    float jacobian = (i == j) ? p_i * (1.0f - p_i) : -p_i * p_j;
-                    d_softmax_scores[i * seq_len + j] = jacobian * d_attention_scores[i * seq_len + j];
+                    sum += probs[j] * d_probs[i * seq_len + j];
+                }
+                for (int j = 0; j <= i; j++)
+                {
+                    d_scores[i * seq_len + j] = probs[j] * (d_probs[i * seq_len + j] - sum);
                 }
             }
-            // Backward through attention score computation (Q*K^T)
-            float *d_query = state->d_temp_buffer2; // Use pre-allocated buffer
-            float *d_key = state->d_moe_out;        // Use pre-allocated buffer
+
+            // --- 5. Backward through Q*K^T / scale
+            float scale = 1.0f / sqrtf((float)head_dim);
+            float *d_query = state->d_temp_buffer2;
+            float *d_key = state->d_moe_out;
             memset(d_query, 0, seq_len * head_dim * sizeof(float));
             memset(d_key, 0, seq_len * head_dim * sizeof(float));
-
-            float scale = 1.0f / sqrtf((float)head_dim);
 
             for (int i = 0; i < seq_len; i++)
             {
                 for (int j = 0; j <= i; j++)
                 {
-                    float d_score = d_softmax_scores[i * seq_len + j] * scale;
-
-                    // Gradient w.r.t. query and key
+                    float d_s = d_scores[i * seq_len + j] * scale;
                     for (int d = 0; d < head_dim; d++)
                     {
-                        d_query[i * head_dim + d] += d_score * qkv_buffer[j * 3 * embed_dim + embed_dim + head_offset + d];
-                        d_key[j * head_dim + d] += d_score * qkv_buffer[i * 3 * embed_dim + head_offset + d];
+                        float qi = state->qkv_buffer[i * 3 * embed_dim + head_offset + d];
+                        float kj = state->qkv_buffer[j * 3 * embed_dim + embed_dim + head_offset + d];
+                        d_query[i * head_dim + d] += d_s * kj;
+                        d_key[j * head_dim + d] += d_s * qi;
                     }
                 }
             }
 
-            // Backward through QKV projection
+            // --- 6. Backward through V
+            float *d_value = state->d_temp_buffer;
+            memset(d_value, 0, seq_len * head_dim * sizeof(float));
+            for (int i = 0; i < seq_len; i++)
+            {
+                float *probs = &state->attention_probs[(l * seq_len + i) * seq_len];
+                for (int j = 0; j <= i; j++)
+                {
+                    for (int d = 0; d < head_dim; d++)
+                    {
+                        int concat_idx = i * embed_dim + head_offset + d;
+                        d_value[j * head_dim + d] += probs[j] * d_attn_concat[concat_idx];
+                    }
+                }
+            }
+
+            // --- 7. Backward through QKV projection
             for (int t = 0; t < seq_len; t++)
             {
-                // Gradient w.r.t. QKV bias
                 for (int d = 0; d < head_dim; d++)
                 {
+                    // biases
                     state->d_attn_qkv_b[l][head_offset + d] += d_query[t * head_dim + d];
                     state->d_attn_qkv_b[l][embed_dim + head_offset + d] += d_key[t * head_dim + d];
                     state->d_attn_qkv_b[l][2 * embed_dim + head_offset + d] += d_value[t * head_dim + d];
-                }
 
-                // Gradient w.r.t. QKV weights and input (ln1_output)
-                for (int d = 0; d < head_dim; d++)
-                {
+                    // weights & input
                     for (int e = 0; e < embed_dim; e++)
                     {
-                        // Q gradients
+                        float x = state->ln1_outputs[l * seq_len * embed_dim + t * embed_dim + e];
+
                         state->d_attn_qkv_w[l][e * 3 * embed_dim + head_offset + d] +=
-                            d_query[t * head_dim + d] * ln1_output[t * embed_dim + e];
-                        d_ln1_out2[t * embed_dim + e] +=
-                            d_query[t * head_dim + d] * layer->attn_qkv_w[e * 3 * embed_dim + head_offset + d];
-
-                        // K gradients
+                            d_query[t * head_dim + d] * x;
                         state->d_attn_qkv_w[l][e * 3 * embed_dim + embed_dim + head_offset + d] +=
-                            d_key[t * head_dim + d] * ln1_output[t * embed_dim + e];
-                        d_ln1_out2[t * embed_dim + e] +=
-                            d_key[t * head_dim + d] * layer->attn_qkv_w[e * 3 * embed_dim + embed_dim + head_offset + d];
-
-                        // V gradients
+                            d_key[t * head_dim + d] * x;
                         state->d_attn_qkv_w[l][e * 3 * embed_dim + 2 * embed_dim + head_offset + d] +=
-                            d_value[t * head_dim + d] * ln1_output[t * embed_dim + e];
+                            d_value[t * head_dim + d] * x;
+
                         d_ln1_out2[t * embed_dim + e] +=
+                            d_query[t * head_dim + d] * layer->attn_qkv_w[e * 3 * embed_dim + head_offset + d] +
+                            d_key[t * head_dim + d] * layer->attn_qkv_w[e * 3 * embed_dim + embed_dim + head_offset + d] +
                             d_value[t * head_dim + d] * layer->attn_qkv_w[e * 3 * embed_dim + 2 * embed_dim + head_offset + d];
                     }
                 }
@@ -2228,6 +1931,269 @@ float calculate_moe_aux_loss(RunState *state, Config *config)
 // ## 6. SIMPLE TRAINING DATA LOADER
 // ============================================================================
 
+void record_training_step(TrainingHistory *history, int step, float loss, float val_loss, float perplexity)
+{
+    if (history->num_records < history->capacity)
+    {
+        history->steps[history->num_records] = step;
+        history->losses[history->num_records] = loss;
+        history->val_losses[history->num_records] = val_loss;
+        history->perplexities[history->num_records] = perplexity;
+        history->num_records++;
+    }
+}
+
+static char *preprocess_text(const char *text)
+{
+    int len = strlen(text);
+    char *out = malloc(len * 3 + 1); // worst-case expansion
+    int j = 0;
+
+    for (int i = 0; i < len; i++)
+    {
+        unsigned char c = text[i];
+
+        if (isupper(c))
+        {
+            out[j++] = (char)tolower(c);
+        }
+        else if (ispunct(c))
+        {
+            if (j > 0 && out[j - 1] != ' ')
+                out[j++] = ' ';
+            out[j++] = c;
+            out[j++] = ' ';
+        }
+        else if (isspace(c))
+        {
+            if (j > 0 && out[j - 1] != ' ')
+                out[j++] = ' ';
+        }
+        else
+        { // digits or other chars
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+    return out; // caller frees
+}
+
+void build_char_vocabulary(Dataset *dataset)
+{
+    // Character-level vocabulary
+    int char_count[256] = {0};
+    for (int i = 0; i < dataset->size; i++)
+    {
+        char_count[(unsigned char)dataset->data[i]]++;
+    }
+
+    dataset->vocab_size = 0;
+    dataset->vocab = malloc(256 * sizeof(char *));
+
+    for (int i = 0; i < 256; i++)
+    {
+        if (char_count[i] > 0)
+        {
+            dataset->vocab[dataset->vocab_size] = malloc(2);
+            dataset->vocab[dataset->vocab_size][0] = (char)i;
+            dataset->vocab[dataset->vocab_size][1] = '\0';
+            dataset->vocab_size++;
+        }
+    }
+
+    // Tokenize
+    dataset->num_tokens = dataset->size;
+    dataset->tokens = malloc(dataset->num_tokens * sizeof(int));
+    for (int i = 0; i < dataset->size; i++)
+    {
+        char c = dataset->data[i];
+        for (int v = 0; v < dataset->vocab_size; v++)
+        {
+            if (dataset->vocab[v][0] == c)
+            {
+                dataset->tokens[i] = v;
+                break;
+            }
+        }
+    }
+}
+
+void build_word_vocabulary(Dataset *dataset)
+{
+    // Simple word-level vocabulary (space-separated)
+    // This is a basic implementation - could be enhanced with BPE
+
+    int max_vocab = 10000;
+    dataset->vocab = malloc(max_vocab * sizeof(char *));
+    int *word_counts = calloc(max_vocab, sizeof(int));
+    dataset->vocab_size = 0;
+
+    // Add special tokens
+    dataset->vocab[dataset->vocab_size++] = strdup("<UNK>");
+    dataset->vocab[dataset->vocab_size++] = strdup("<PAD>");
+
+    /* ----------  NEW PRE-PROCESSING  ---------- */
+    char *processed = preprocess_text(dataset->data); // malloc'd
+    free(dataset->data);                              // free old buffer
+    dataset->data = processed;                        // adopt new buffer
+    /* ------------------------------------------ */
+
+    // Tokenize by spaces and build vocab
+    char *data_copy = strdup(dataset->data);
+    char *token = strtok(data_copy, " \n\t\r");
+
+    // First pass: build vocabulary
+    while (token != NULL && dataset->vocab_size < max_vocab - 1)
+    {
+        // Check if token already exists
+        int found = -1;
+        for (int i = 0; i < dataset->vocab_size; i++)
+        {
+            if (strcmp(dataset->vocab[i], token) == 0)
+            {
+                found = i;
+                break;
+            }
+        }
+
+        if (found >= 0)
+        {
+            word_counts[found]++;
+        }
+        else
+        {
+            dataset->vocab[dataset->vocab_size] = strdup(token);
+            word_counts[dataset->vocab_size] = 1;
+            dataset->vocab_size++;
+        }
+
+        token = strtok(NULL, " \n\t\r");
+    }
+
+    free(data_copy);
+
+    // Second pass: tokenize
+    data_copy = strdup(dataset->data);
+    token = strtok(data_copy, " \n\t\r");
+
+    // Count tokens first
+    int token_count = 0;
+    char *temp_copy = strdup(dataset->data);
+    char *temp_token = strtok(temp_copy, " \n\t\r");
+    while (temp_token != NULL)
+    {
+        token_count++;
+        temp_token = strtok(NULL, " \n\t\r");
+    }
+    free(temp_copy);
+
+    dataset->num_tokens = token_count;
+    dataset->tokens = malloc(dataset->num_tokens * sizeof(int));
+
+    int token_idx = 0;
+    while (token != NULL && token_idx < dataset->num_tokens)
+    {
+        int found = 0; // UNK token
+        for (int i = 0; i < dataset->vocab_size; i++)
+        {
+            if (strcmp(dataset->vocab[i], token) == 0)
+            {
+                found = i;
+                break;
+            }
+        }
+        dataset->tokens[token_idx++] = found;
+        token = strtok(NULL, " \n\t\r");
+    }
+
+    free(data_copy);
+    free(word_counts);
+}
+
+void load_dataset(Dataset *dataset, DatasetType type, const char *custom_path)
+{
+    const char *filename;
+    const char *url;
+
+    switch (type)
+    {
+    case DATASET_TINYSHAKESPEARE:
+        filename = "tinyshakespeare.txt";
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
+        dataset->name = strdup("TinyShakespeare");
+        dataset->use_word_level = 0; // Character level for Shakespeare
+        break;
+
+    case DATASET_TINYSTORIES:
+        filename = "tinystories.txt";
+        url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-train.txt";
+        dataset->name = strdup("TinyStories");
+        dataset->use_word_level = 1; // Word level for stories
+        break;
+
+    case DATASET_CUSTOM:
+        filename = custom_path;
+        url = NULL;
+        dataset->name = strdup("Custom");
+        dataset->use_word_level = 0; // Default to char level
+        break;
+    }
+
+    dataset->type = type;
+
+    // Download if doesn't exist (except for custom)
+    if (type != DATASET_CUSTOM && !file_exists(filename))
+    {
+        download_dataset(url, filename);
+    }
+
+    // Load file
+    FILE *file = fopen(filename, "r");
+    if (!file)
+    {
+        printf("Error: Could not open %s\n", filename);
+        if (type == DATASET_TINYSHAKESPEARE)
+        {
+            printf("Please download from: %s\n", url);
+        }
+        exit(1);
+    }
+
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    dataset->size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Read entire file
+    dataset->data = malloc(dataset->size + 1);
+    fread(dataset->data, 1, dataset->size, file);
+    dataset->data[dataset->size] = '\0';
+    fclose(file);
+
+    printf("✓ Loaded %s: %d characters\n", dataset->name, dataset->size);
+
+    // Build vocabulary and tokenize
+    if (dataset->use_word_level)
+    {
+        build_word_vocabulary(dataset);
+    }
+    else
+    {
+        build_char_vocabulary(dataset);
+    }
+
+    // Create train/val split (90/10)
+    dataset->train_tokens = (int)(dataset->num_tokens * 0.9);
+    dataset->val_tokens = dataset->num_tokens - dataset->train_tokens;
+
+    dataset->train_data = dataset->tokens;
+    dataset->val_data = &dataset->tokens[dataset->train_tokens];
+
+    printf("✓ Vocabulary size: %d\n", dataset->vocab_size);
+    printf("✓ Train tokens: %d, Validation tokens: %d\n",
+           dataset->train_tokens, dataset->val_tokens);
+}
+
 void load_tiny_shakespeare(Dataset *dataset)
 {
     // Try to open the file
@@ -2286,6 +2252,45 @@ void load_tiny_shakespeare(Dataset *dataset)
     }
 }
 
+float validate_model(GPT2_MoE_Model *model, RunState *state, Dataset *dataset, Config *config)
+{
+    int val_steps = 10;
+    float total_loss = 0.0f;
+    for (int i = 0; i < val_steps; i++)
+    {
+        int start = rand() % (dataset->val_tokens - config->seq_len - 1);
+        int *inputs = &dataset->val_data[start];
+        int *targets = &dataset->val_data[start + 1];
+        forward_pass(model, state, inputs);
+        float loss = calculate_crossentropy_loss(state->logits, targets, config);
+        total_loss += loss;
+    }
+    return total_loss / val_steps;
+}
+
+float get_adaptive_learning_rate(int step, int warmup, int total, float max_lr, float min_lr)
+{
+    if (step < warmup)
+    {
+        return max_lr * (step / (float)warmup);
+    }
+    float progress = (step - warmup) / (float)(total - warmup);
+    return max_lr - (max_lr - min_lr) * progress;
+}
+
+float calculate_perplexity(float *logits, int *targets, Config *config, int normalize)
+{
+    float loss = calculate_crossentropy_loss(logits, targets, config);
+    return expf(loss);
+}
+
+void generate_training_sample(GPT2_MoE_Model *model, RunState *state, Dataset *dataset, Config *config, int step)
+{
+    const char *prompt = (dataset->type == DATASET_TINYSHAKESPEARE) ? "To be or not to be" : "Once upon a time";
+    GenerationConfig gen_config = create_generation_config();
+    generate_text_enhanced(model, state, dataset, prompt, 50, 0.8f, 0.9f, &gen_config);
+}
+
 // ============================================================================
 // ## 7. MAIN TRAINING LOOP
 // ============================================================================
@@ -2295,336 +2300,470 @@ int min(int a, int b)
     return (a < b) ? a : b;
 }
 
+void print_usage(const char *program_name)
+{
+    printf("=== GPT-2 MoE Transformer - Enhanced Edition ===\n\n");
+    printf("Usage: %s [MODE] [OPTIONS]\n\n", program_name);
+
+    printf("MODES:\n");
+    printf("  train          Train a new model (default)\n");
+    printf("  generate       Generate text using trained model\n");
+    printf("  analyze        Analyze expert usage and model statistics\n\n");
+
+    printf("DATASET OPTIONS:\n");
+    printf("  --dataset shakespeare    Use TinyShakespeare dataset (default)\n");
+    printf("  --dataset stories        Use TinyStories dataset\n");
+    printf("  --dataset <path>         Use custom dataset file\n\n");
+
+    printf("GENERATION OPTIONS:\n");
+    printf("  --prompt \"text\"          Starting prompt for generation\n");
+    printf("  --length N               Number of tokens to generate (default: 100)\n");
+    printf("  --temperature T          Sampling temperature 0.1-2.0 (default: 0.8)\n");
+    printf("  --top_p P                Nucleus sampling threshold 0.1-1.0 (default: 0.9)\n\n");
+
+    printf("EXAMPLES:\n");
+    printf("  # Train on Shakespeare\n");
+    printf("  %s train --dataset shakespeare\n\n", program_name);
+
+    printf("  # Train on TinyStories\n");
+    printf("  %s train --dataset stories\n\n", program_name);
+
+    printf("  # Generate Shakespearean text\n");
+    printf("  %s generate --dataset shakespeare --prompt \"To be or not to be\" --length 200\n\n", program_name);
+
+    printf("  # Generate a story\n");
+    printf("  %s generate --dataset stories --prompt \"Once upon a time\" --temperature 0.7\n\n", program_name);
+
+    printf("  # Analyze model\n");
+    printf("  %s analyze --dataset shakespeare\n\n", program_name);
+
+    printf("NOTES:\n");
+    printf("  - Models are automatically saved with timestamps and loss values\n");
+    printf("  - Best models are saved as 'moe_model_best.bin'\n");
+    printf("  - Training includes validation and early stopping\n");
+    printf("  - Generation includes repetition penalty and quality control\n");
+    printf("  - Datasets are automatically downloaded if not present\n\n");
+}
+
 int main(int argc, char *argv[])
 {
     srand(time(NULL));
-    printf("=== GPT-2 MoE Transformer ===\n");
-    printf("Starting program initialization...\n");
-    fflush(stdout);
+    printf("=== GPT-2 MoE Transformer - Enhanced Edition ===\n");
 
-    // 1. Setup Configuration
-    Config config = {
-        .vocab_size = 64, // Will be adjusted based on dataset
-        .seq_len = 32,    // Shorter sequences for demo
-        .embed_dim = 64,  // Smaller for faster training
-        .num_layers = 2,  // Fewer layers
-        .num_heads = 4,
-        .num_experts = 4, // Fewer experts
-        .top_k = 2,
-        .hidden_dim = 128};
+    // Parse command line arguments for dataset selection
+    DatasetType dataset_type = DATASET_TINYSHAKESPEARE;
+    const char *custom_dataset_path = NULL;
 
-    // Check command line arguments
+    // Enhanced CLI parsing
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--dataset") == 0 && i + 1 < argc)
+        {
+            if (strcmp(argv[i + 1], "shakespeare") == 0)
+            {
+                dataset_type = DATASET_TINYSHAKESPEARE;
+            }
+            else if (strcmp(argv[i + 1], "stories") == 0)
+            {
+                dataset_type = DATASET_TINYSTORIES;
+            }
+            else
+            {
+                dataset_type = DATASET_CUSTOM;
+                custom_dataset_path = argv[i + 1];
+            }
+            i++;
+        }
+    }
+
+    // Handle different modes
     if (argc > 1)
     {
         if (strcmp(argv[1], "generate") == 0)
         {
-            printf("[MODE] Text Generation Mode\n");
-            printf("Loading model for text generation...\n");
+            printf("[MODE] Enhanced Text Generation\n");
 
-            // Load model and generate text
             GPT2_MoE_Model model;
             RunState state;
+            ModelMetadata metadata;
 
-            if (!load_model(&model, "moe_model.bin"))
+            // Try to load the best model
+            if (!load_model_with_metadata(&model, "moe_model_best.bin", &metadata))
             {
-                printf("ERROR: Failed to load model. Please train first.\n");
-                return 1;
+                printf("No best model found. Trying latest...\n");
+                if (!load_model(&model, "moe_model.bin"))
+                {
+                    printf("ERROR: No trained model found. Please train first.\n");
+                    return 1;
+                }
             }
 
-            config = model.config;
-            printf("✓ Model loaded successfully\n");
-            printf("  Configuration: seq_len=%d, embed_dim=%d, vocab_size=%d\n",
-                   config.seq_len, config.embed_dim, config.vocab_size);
-            printf("  Layers: %d, Experts: %d, Heads: %d\n",
-                   config.num_layers, config.num_experts, config.num_heads);
-
-            build_state(&state, &config);
-            printf("✓ Run state initialized\n");
+            build_state(&state, &model.config);
 
             Dataset dataset;
-            printf("Loading dataset...\n");
-            load_tiny_shakespeare(&dataset);
-            config.vocab_size = dataset.vocab_size;
-            printf("✓ Dataset loaded: %d tokens, %d vocabulary size\n",
-                   dataset.num_tokens, dataset.vocab_size);
+            load_dataset(&dataset, dataset_type, custom_dataset_path);
 
-            // Parse command line arguments for generation
+            // Parse generation parameters
             const char *prompt = "To be or not to be";
             int max_tokens = 100;
             float temperature = 0.8f;
             float top_p = 0.9f;
 
-            // Parse additional arguments
-            printf("Parsing command line arguments...\n");
             for (int i = 2; i < argc; i++)
             {
                 if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc)
                 {
                     prompt = argv[i + 1];
-                    printf("  ✓ Prompt set: \"%s\"\n", prompt);
                     i++;
                 }
                 else if (strcmp(argv[i], "--length") == 0 && i + 1 < argc)
                 {
                     max_tokens = atoi(argv[i + 1]);
-                    printf("  ✓ Generation length set: %d tokens\n", max_tokens);
                     i++;
                 }
                 else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc)
                 {
                     temperature = atof(argv[i + 1]);
-                    printf("  ✓ Temperature set: %.2f\n", temperature);
                     i++;
                 }
                 else if (strcmp(argv[i], "--top_p") == 0 && i + 1 < argc)
                 {
                     top_p = atof(argv[i + 1]);
-                    printf("  ✓ Top-p sampling set: %.2f\n", top_p);
                     i++;
-                }
-                else
-                {
-                    printf("  ⚠ Unknown argument: %s\n", argv[i]);
                 }
             }
 
-            printf("\n=== Generation Parameters ===\n");
-            printf("Prompt: \"%s\"\n", prompt);
-            printf("Length: %d tokens\n", max_tokens);
-            printf("Temperature: %.2f\n", temperature);
-            printf("Top-p: %.2f\n", top_p);
+            GenerationConfig gen_config = create_generation_config();
+            generate_text_enhanced(&model, &state, &dataset, prompt, max_tokens,
+                                   temperature, top_p, &gen_config);
 
-            generate_text(&model, &state, &dataset, prompt, max_tokens, temperature, top_p);
-
-            free_state(&state, &config);
+            free_state(&state, &model.config);
             free_model(&model);
             free_dataset(&dataset);
-            printf("✓ Cleanup completed\n");
             return 0;
         }
         else if (strcmp(argv[1], "analyze") == 0)
         {
-            printf("[MODE] Expert Usage Analysis Mode\n");
-            printf("Loading model for expert analysis...\n");
+            printf("[MODE] Enhanced Expert Analysis\n");
 
-            // Load model and analyze expert usage
             GPT2_MoE_Model model;
             RunState state;
+            ModelMetadata metadata;
 
-            if (!load_model(&model, "moe_model.bin"))
+            if (!load_model_with_metadata(&model, "moe_model_best.bin", &metadata))
             {
-                printf("ERROR: Failed to load model. Please train first.\n");
-                return 1;
+                if (!load_model(&model, "moe_model.bin"))
+                {
+                    printf("ERROR: No trained model found.\n");
+                    return 1;
+                }
             }
 
-            config = model.config;
-            printf("✓ Model loaded successfully\n");
-            build_state(&state, &config);
-            printf("✓ Run state initialized\n");
+            build_state(&state, &model.config);
 
             Dataset dataset;
-            printf("Loading dataset...\n");
-            load_tiny_shakespeare(&dataset);
-            config.vocab_size = dataset.vocab_size;
-            printf("✓ Dataset loaded\n");
+            load_dataset(&dataset, dataset_type, custom_dataset_path);
 
-            // Run one forward pass to collect expert usage data
-            printf("Running forward pass for analysis...\n");
-            int max_start = dataset.num_tokens - config.seq_len - 1;
-            if (max_start > 0)
+            // Comprehensive analysis
+            printf("\n=== Model Analysis ===\n");
+            printf("Training metadata:\n");
+            printf("  Steps: %d\n", metadata.training_steps);
+            printf("  Best loss: %.4f\n", metadata.best_loss);
+            printf("  Validation loss: %.4f\n", metadata.validation_loss);
+            printf("  Perplexity: %.2f\n", metadata.perplexity);
+
+            // Run multiple forward passes for analysis
+            for (int i = 0; i < 10; i++)
             {
-                int start_pos = rand() % max_start;
-                int *inputs = &dataset.tokens[start_pos];
-                printf("Processing sequence starting at position %d\n", start_pos);
-                forward_pass(&model, &state, inputs);
-                analyze_expert_usage(&state, &config, 1);
-            }
-            else
-            {
-                printf("ERROR: Dataset too small for analysis\n");
+                int max_start = dataset.train_tokens - model.config.seq_len - 1;
+                if (max_start > 0)
+                {
+                    int start_pos = rand() % max_start;
+                    forward_pass(&model, &state, &dataset.tokens[start_pos]);
+                }
             }
 
-            free_state(&state, &config);
+            analyze_expert_usage(&state, &model.config, 10);
+
+            free_state(&state, &model.config);
             free_model(&model);
             free_dataset(&dataset);
-            printf("✓ Analysis completed\n");
             return 0;
         }
         else if (strcmp(argv[1], "train") != 0)
         {
-            printf("=== GPT-2 MoE Transformer ===\n");
-            printf("Invalid command: %s\n\n", argv[1]);
-            printf("Usage: %s [train|generate|analyze]\n", argv[0]);
-            printf("\nCommands:\n");
-            printf("  train                           Train the model\n");
-            printf("  generate                       Generate text with default parameters\n");
-            printf("  generate [options]             Generate text with custom parameters\n");
-            printf("  analyze                        Analyze expert usage statistics\n");
+            printf("Usage: %s [train|generate|analyze] [options]\n", argv[0]);
+            printf("\nDataset Options:\n");
+            printf("  --dataset shakespeare    Use TinyShakespeare (default)\n");
+            printf("  --dataset stories        Use TinyStories\n");
+            printf("  --dataset <path>         Use custom dataset\n");
             printf("\nGeneration Options:\n");
-            printf("  --prompt \"text\"               Set the initial prompt\n");
-            printf("  --length N                     Set number of tokens to generate\n");
-            printf("  --temperature T                Set sampling temperature (0.0-2.0)\n");
-            printf("  --top_p P                      Set nucleus sampling threshold (0.0-1.0)\n");
-            printf("\nExamples:\n");
-            printf("  %s train\n", argv[0]);
-            printf("  %s generate\n", argv[0]);
-            printf("  %s generate --prompt \"Once upon a time\" --length 100\n", argv[0]);
-            printf("  %s generate --prompt \"Hello\" --temperature 0.7 --top_p 0.9\n", argv[0]);
-            printf("  %s analyze\n", argv[0]);
+            printf("  --prompt \"text\"          Set prompt\n");
+            printf("  --length N               Set generation length\n");
+            printf("  --temperature T          Set sampling temperature\n");
+            printf("  --top_p P                Set nucleus sampling\n");
             return 1;
         }
     }
 
-    // Training mode
-    printf("[MODE] Training Mode\n");
+    // Enhanced Training Mode
+    printf("[MODE] Enhanced Training\n");
 
-    // 2. Load Data
-    printf("Loading dataset...\n");
-    fflush(stdout);
+    // Load dataset
     Dataset dataset;
-    load_tiny_shakespeare(&dataset);
-    config.vocab_size = dataset.vocab_size;
+    load_dataset(&dataset, dataset_type, custom_dataset_path);
 
-    printf("=== MoE Transformer Training ===\n");
-    printf("✓ Loaded dataset with %d tokens and vocabulary size %d\n",
-           dataset.num_tokens, dataset.vocab_size);
-    printf("Model configuration:\n");
-    printf("  Sequence length: %d\n", config.seq_len);
-    printf("  Embedding dimension: %d\n", config.embed_dim);
-    printf("  Number of layers: %d\n", config.num_layers);
-    printf("  Number of experts: %d\n", config.num_experts);
-    printf("  Top-K experts: %d\n", config.top_k);
-    printf("  Hidden dimension: %d\n", config.hidden_dim);
+    // Configure model based on dataset
+    Config config;
+    if (dataset.type == DATASET_TINYSHAKESPEARE)
+    {
+        config = (Config){
+            .vocab_size = dataset.vocab_size,
+            .seq_len = 128,   // Longer for Shakespeare
+            .embed_dim = 128, // Larger embedding
+            .num_layers = 4,  // More layers
+            .num_heads = 8,   // More heads
+            .num_experts = 8, // More experts
+            .top_k = 2,
+            .hidden_dim = 256 // Larger hidden dim
+        };
+    }
+    else if (dataset.type == DATASET_TINYSTORIES)
+    {
+        config = (Config){
+            .vocab_size = dataset.vocab_size,
+            .seq_len = 64,    // Shorter for simple stories
+            .embed_dim = 64,  // Smaller embedding
+            .num_layers = 2,  // Fewer layers
+            .num_heads = 4,   // Fewer heads
+            .num_experts = 4, // Fewer experts
+            .top_k = 2,
+            .hidden_dim = 128 // Smaller hidden dim
+        };
+    }
+    else
+    {
+        // Default config for custom datasets
+        config = (Config){
+            .vocab_size = dataset.vocab_size,
+            .seq_len = 64,
+            .embed_dim = 64,
+            .num_layers = 2,
+            .num_heads = 4,
+            .num_experts = 4,
+            .top_k = 2,
+            .hidden_dim = 128};
+    }
 
-    // 3. Initialize Model and State
-    printf("Building model...\n");
-    fflush(stdout);
+    printf("\n=== Enhanced Training Configuration ===\n");
+    printf("Dataset: %s\n", dataset.name);
+    printf("Vocabulary size: %d\n", config.vocab_size);
+    printf("Sequence length: %d\n", config.seq_len);
+    printf("Embedding dimension: %d\n", config.embed_dim);
+    printf("Transformer layers: %d\n", config.num_layers);
+    printf("Attention heads: %d\n", config.num_heads);
+    printf("MoE experts: %d (top-%d)\n", config.num_experts, config.top_k);
+    printf("Expert hidden dimension: %d\n", config.hidden_dim);
+
+    // Initialize model and training components
     GPT2_MoE_Model model;
     RunState state;
     Optimizer optimizer;
+
     build_model(&model, &config);
-    printf("✓ Model built successfully\n");
-
-    printf("Building state...\n");
-    fflush(stdout);
     build_state(&state, &config);
-    printf("✓ State built successfully\n");
-
-    int approx_params = config.vocab_size * config.embed_dim +
-                        config.num_layers * config.num_experts * config.hidden_dim * config.embed_dim;
-    printf("\nModel initialized with ~%d parameters\n", approx_params);
-
-    // 4. Initialize Optimizer
-    printf("Initializing optimizer...\n");
-    fflush(stdout);
     init_optimizer(&optimizer, &config);
-    printf("✓ Optimizer initialized\n");
 
-    // 5. Training Loop
-    printf("\n=== Training Started ===\n");
-    fflush(stdout);
-    int num_steps = 1000;
-    float learning_rate = 0.0005f;
-    float best_loss = INFINITY;
+    TrainingHistory *history = create_training_history(10000);
 
-    time_t start_training_time = time(NULL);
-    printf("Training will run for %d steps\n", num_steps);
+    // Enhanced training parameters
+    int num_steps = 3000;   // Much more training
+    int warmup_steps = 200; // Warmup period
+    float max_learning_rate = 0.0002f;
+    float min_learning_rate = 0.0001f;
+    int validation_interval = 100; // Validate every 100 steps
+    int sample_interval = 200;     // Generate samples every 200 steps
+    int save_interval = 500;       // Save checkpoint every 500 steps
+
+    float best_val_loss = INFINITY;
+    int patience = 1000; // Early stopping patience
+    int steps_without_improvement = 0;
+
+    printf("\n=== Enhanced Training Started ===\n");
+    printf("Training steps: %d\n", num_steps);
+    printf("Warmup steps: %d\n", warmup_steps);
+    printf("Learning rate: %.4f -> %.4f\n", max_learning_rate, min_learning_rate);
+    printf("Validation interval: %d\n", validation_interval);
+    printf("Sample generation interval: %d\n", sample_interval);
+
+    time_t start_time = time(NULL);
 
     for (int step = 0; step < num_steps; step++)
     {
-        printf("[STEP %4d] ", step);
-        fflush(stdout);
+        // Adaptive learning rate
+        float learning_rate = get_adaptive_learning_rate(step, warmup_steps, num_steps,
+                                                         max_learning_rate, min_learning_rate);
 
-        // Get a batch
-        int max_start = dataset.num_tokens - config.seq_len - 1;
+        // Get training batch
+        int max_start = dataset.train_tokens - config.seq_len - 1;
         if (max_start <= 0)
         {
-            printf("ERROR: Dataset too small for sequence length\n");
+            printf("ERROR: Training data too small\n");
             break;
         }
 
         int start_pos = rand() % max_start;
-        int *inputs = &dataset.tokens[start_pos];
-        int *targets = &dataset.tokens[start_pos + 1];
+        int *inputs = &dataset.train_data[start_pos];
+        int *targets = &dataset.train_data[start_pos + 1];
 
         // Forward pass
         forward_pass(&model, &state, inputs);
 
-        // Calculate losses
-        float primary_loss = calculate_crossentropy_loss(state.logits, targets, &config);
+        // Calculate loss
+        float train_loss = calculate_crossentropy_loss(state.logits, targets, &config);
         float aux_loss = calculate_moe_aux_loss(&state, &config);
-        float total_loss = primary_loss + 0.01f * aux_loss;
-
-        if (total_loss < best_loss)
-        {
-            best_loss = total_loss;
-        }
+        float total_loss = train_loss + 0.01f * aux_loss;
 
         if (!isfinite(total_loss))
         {
-            printf("ERROR: Invalid loss detected (NaN/Inf)\n");
+            printf("ERROR: NaN/Inf loss at step %d\n", step);
             break;
         }
 
-        // Backward pass - FIXED: Pass inputs parameter
+        // Backward pass and optimization
         backward_pass(&model, &state, inputs, targets, total_loss);
-
-        // Update weights
         update_weights(&model, &state, &optimizer, learning_rate);
 
         // Progress reporting
-        if (step % 10 == 0)
+        if (step % 1 == 0)
         {
-            printf("Loss: %.4f (Primary: %.4f, Aux: %.4f) | Best: %.4f\n",
-                   total_loss, primary_loss, aux_loss, best_loss);
+            printf("[%4d/%4d] Loss: %.4f (train: %.4f, aux: %.4f) LR: %.6f\n",
+                   step, num_steps, total_loss, train_loss, aux_loss, learning_rate);
+        }
+        else if (step % 10 == 0)
+        {
+            putchar('.');
+            fflush(stdout);
         }
 
-        // Save model periodically
-        if (step % 100 == 0 && step > 0)
+        // Validation
+        float val_loss = INFINITY;
+        float perplexity = INFINITY;
+        if (step % validation_interval == 0 && step > 0)
         {
-            char filename[40];
-            sprintf(filename, "moe_model_step_%d.bin", step);
-            printf("  Saving checkpoint: %s\n", filename);
+            val_loss = validate_model(&model, &state, &dataset, &config);
+            perplexity = calculate_perplexity(state.logits, targets, &config, 1);
+
+            printf("  Validation - Loss: %.4f, Perplexity: %.2f\n", val_loss, perplexity);
+
+            // Check for improvement
+            if (val_loss < best_val_loss)
+            {
+                best_val_loss = val_loss;
+                steps_without_improvement = 0;
+
+                // Save best model
+                ModelMetadata metadata = {0};
+                strncpy(metadata.timestamp, "best", sizeof(metadata.timestamp));
+                metadata.best_loss = best_val_loss;
+                metadata.training_steps = step;
+                metadata.dataset_type = dataset.type;
+                metadata.config = config;
+                metadata.validation_loss = val_loss;
+                metadata.perplexity = perplexity;
+
+                save_model_with_metadata(&model, "moe_model_best.bin", &metadata);
+                printf("  ✓ New best model saved!\n");
+            }
+            else
+            {
+                steps_without_improvement += validation_interval;
+            }
+
+            record_training_step(history, step, train_loss, val_loss, perplexity);
+        }
+
+        // Generate training samples
+        if (step % sample_interval == 0 && step > 0)
+        {
+            generate_training_sample(&model, &state, &dataset, &config, step);
+        }
+
+        // Save periodic checkpoints
+        if (step % save_interval == 0 && step > 0)
+        {
+            char *filename = generate_model_filename("moe_model_checkpoint",
+                                                     step, train_loss);
             save_model(&model, filename);
+            printf("  ✓ Checkpoint saved: %s\n", filename);
+            free(filename);
         }
 
-        // Exit after first step for debugging
-        if (step == 0)
+        // Early stopping check
+        if (steps_without_improvement >= patience)
         {
-            printf("✓ First step completed successfully!\n");
+            printf("Early stopping: no improvement for %d steps\n", patience);
             break;
         }
     }
 
-    time_t end_training_time = time(NULL);
-    double training_duration = difftime(end_training_time, start_training_time);
+    time_t end_time = time(NULL);
+    double training_duration = difftime(end_time, start_time);
 
-    printf("\n=== Training Completed ===\n");
-    printf("Final best loss: %.4f\n", best_loss);
-    printf("Training duration: %.0f seconds\n", training_duration);
+    printf("\n=== Enhanced Training Complete ===\n");
+    printf("Training duration: %.0f seconds (%.2f minutes)\n",
+           training_duration, training_duration / 60.0);
+    printf("Best validation loss: %.4f\n", best_val_loss);
+    printf("Total steps completed: %d\n", optimizer.step);
 
     // Save final model
-    printf("Saving final model...\n");
-    save_model(&model, "moe_model.bin");
-    printf("✓ Model saved as 'moe_model.bin'\n");
+    char *final_filename = generate_model_filename("moe_model_final",
+                                                   optimizer.step, best_val_loss);
 
-    // Analyze expert usage
-    printf("Analyzing expert usage...\n");
+    ModelMetadata final_metadata = {0};
+    time_t now = time(NULL);
+    strftime(final_metadata.timestamp, sizeof(final_metadata.timestamp),
+             "%Y-%m-%d %H:%M:%S", localtime(&now));
+    final_metadata.best_loss = best_val_loss;
+    final_metadata.training_steps = optimizer.step;
+    final_metadata.dataset_type = dataset.type;
+    final_metadata.config = config;
+    final_metadata.validation_loss = best_val_loss;
+
+    save_model_with_metadata(&model, final_filename, &final_metadata);
+    printf("✓ Final model saved: %s\n", final_filename);
+
+    // Final analysis
+    printf("\n=== Final Model Analysis ===\n");
     analyze_expert_usage(&state, &config, 1);
 
+    // Generate final sample
+    printf("\n=== Final Generation Test ===\n");
+    GenerationConfig gen_config = create_generation_config();
+    const char *test_prompt = (dataset.type == DATASET_TINYSHAKESPEARE) ? "To be or not to be" : "Once upon a time";
+    generate_text_enhanced(&model, &state, &dataset, test_prompt, 100,
+                           0.8f, 0.9f, &gen_config);
+
     // Cleanup
-    printf("\n=== Cleaning Up ===\n");
+    free(final_filename);
+    free(history->losses);
+    free(history->val_losses);
+    free(history->perplexities);
+    free(history->steps);
+    free(history);
+
     free_model(&model);
     free_state(&state, &config);
     free_dataset(&dataset);
     free_optimizer(&optimizer, &config);
-    printf("✓ All resources cleaned up\n");
 
-    printf("\n=== Training Success ===\n");
-    printf("Training completed successfully in %.0f seconds!\n", training_duration);
-    printf("\nNext steps:\n");
-    printf("  %s generate --prompt \"Your text here\" --length 100\n", argv[0]);
-    printf("  %s analyze\n", argv[0]);
+    printf("\n=== Training Success! ===\n");
+    printf("Next steps:\n");
+    printf("  %s generate --dataset %s --prompt \"Your prompt here\"\n",
+           argv[0], (dataset.type == DATASET_TINYSHAKESPEARE) ? "shakespeare" : "stories");
+    printf("  %s analyze --dataset %s\n", argv[0],
+           (dataset.type == DATASET_TINYSHAKESPEARE) ? "shakespeare" : "stories");
+
     return 0;
 }
 
@@ -2698,6 +2837,189 @@ void save_model(GPT2_MoE_Model *model, const char *filename)
 
     fclose(file);
     printf("Model saved successfully to %s\n", filename);
+}
+
+void save_model_with_metadata(GPT2_MoE_Model *model, const char *filename,
+                              ModelMetadata *metadata)
+{
+    FILE *file = fopen(filename, "wb");
+    if (!file)
+    {
+        printf("Error: Could not open file %s for writing\n", filename);
+        return;
+    }
+
+    // Write metadata first
+    fwrite(metadata, sizeof(ModelMetadata), 1, file);
+
+    // Write config
+    fwrite(&model->config, sizeof(Config), 1, file);
+
+    Config *config = &model->config;
+
+    // Write token embeddings
+    fwrite(model->token_embeddings, sizeof(float),
+           config->vocab_size * config->embed_dim, file);
+
+    // Write positional embeddings
+    fwrite(model->pos_embeddings, sizeof(float),
+           config->seq_len * config->embed_dim, file);
+
+    // Write transformer layers
+    for (int l = 0; l < config->num_layers; l++)
+    {
+        TransformerBlock *layer = &model->layers[l];
+
+        // Attention weights
+        fwrite(layer->attn_qkv_w, sizeof(float),
+               config->embed_dim * 3 * config->embed_dim, file);
+        fwrite(layer->attn_qkv_b, sizeof(float), 3 * config->embed_dim, file);
+        fwrite(layer->attn_proj_w, sizeof(float),
+               config->embed_dim * config->embed_dim, file);
+        fwrite(layer->attn_proj_b, sizeof(float), config->embed_dim, file);
+
+        // Layer norm
+        fwrite(layer->ln1_gamma, sizeof(float), config->embed_dim, file);
+        fwrite(layer->ln1_beta, sizeof(float), config->embed_dim, file);
+        fwrite(layer->ln2_gamma, sizeof(float), config->embed_dim, file);
+        fwrite(layer->ln2_beta, sizeof(float), config->embed_dim, file);
+
+        // MoE layer
+        MoELayer *moe = &layer->moe_layer;
+        fwrite(moe->gating_w, sizeof(float),
+               config->embed_dim * config->num_experts, file);
+        fwrite(moe->gating_b, sizeof(float), config->num_experts, file);
+
+        // Experts
+        for (int e = 0; e < config->num_experts; e++)
+        {
+            Expert *expert = &moe->experts[e];
+            fwrite(expert->w1, sizeof(float),
+                   config->embed_dim * config->hidden_dim, file);
+            fwrite(expert->b1, sizeof(float), config->hidden_dim, file);
+            fwrite(expert->w2, sizeof(float),
+                   config->hidden_dim * config->embed_dim, file);
+            fwrite(expert->b2, sizeof(float), config->embed_dim, file);
+        }
+    }
+
+    // Write final layer norm
+    fwrite(model->final_ln_gamma, sizeof(float), config->embed_dim, file);
+    fwrite(model->final_ln_beta, sizeof(float), config->embed_dim, file);
+
+    fclose(file);
+    printf("✓ Model with metadata saved to %s\n", filename);
+}
+
+int load_model_with_metadata(GPT2_MoE_Model *model, const char *filename,
+                             ModelMetadata *metadata)
+{
+    FILE *file = fopen(filename, "rb");
+    if (!file)
+    {
+        printf("Error: Could not open file %s for reading\n", filename);
+        return 0;
+    }
+
+    // Read metadata first
+    if (fread(metadata, sizeof(ModelMetadata), 1, file) != 1)
+    {
+        printf("Error reading metadata from file\n");
+        fclose(file);
+        return 0;
+    }
+
+    // Read config
+    if (fread(&model->config, sizeof(Config), 1, file) != 1)
+    {
+        printf("Error reading config from file\n");
+        fclose(file);
+        return 0;
+    }
+
+    Config *config = &model->config;
+
+    // Allocate and read token embeddings
+    model->token_embeddings = malloc(config->vocab_size * config->embed_dim * sizeof(float));
+    fread(model->token_embeddings, sizeof(float),
+          config->vocab_size * config->embed_dim, file);
+
+    // Allocate and read positional embeddings
+    model->pos_embeddings = malloc(config->seq_len * config->embed_dim * sizeof(float));
+    fread(model->pos_embeddings, sizeof(float),
+          config->seq_len * config->embed_dim, file);
+
+    // Allocate transformer layers
+    model->layers = malloc(config->num_layers * sizeof(TransformerBlock));
+
+    for (int l = 0; l < config->num_layers; l++)
+    {
+        TransformerBlock *layer = &model->layers[l];
+
+        // Allocate and read attention weights
+        layer->attn_qkv_w = malloc(config->embed_dim * 3 * config->embed_dim * sizeof(float));
+        layer->attn_qkv_b = malloc(3 * config->embed_dim * sizeof(float));
+        layer->attn_proj_w = malloc(config->embed_dim * config->embed_dim * sizeof(float));
+        layer->attn_proj_b = malloc(config->embed_dim * sizeof(float));
+
+        fread(layer->attn_qkv_w, sizeof(float),
+              config->embed_dim * 3 * config->embed_dim, file);
+        fread(layer->attn_qkv_b, sizeof(float), 3 * config->embed_dim, file);
+        fread(layer->attn_proj_w, sizeof(float),
+              config->embed_dim * config->embed_dim, file);
+        fread(layer->attn_proj_b, sizeof(float), config->embed_dim, file);
+
+        // Allocate and read layer norm
+        layer->ln1_gamma = malloc(config->embed_dim * sizeof(float));
+        layer->ln1_beta = malloc(config->embed_dim * sizeof(float));
+        layer->ln2_gamma = malloc(config->embed_dim * sizeof(float));
+        layer->ln2_beta = malloc(config->embed_dim * sizeof(float));
+
+        fread(layer->ln1_gamma, sizeof(float), config->embed_dim, file);
+        fread(layer->ln1_beta, sizeof(float), config->embed_dim, file);
+        fread(layer->ln2_gamma, sizeof(float), config->embed_dim, file);
+        fread(layer->ln2_beta, sizeof(float), config->embed_dim, file);
+
+        // Allocate and read MoE layer
+        MoELayer *moe = &layer->moe_layer;
+        moe->gating_w = malloc(config->embed_dim * config->num_experts * sizeof(float));
+        moe->gating_b = malloc(config->num_experts * sizeof(float));
+
+        fread(moe->gating_w, sizeof(float),
+              config->embed_dim * config->num_experts, file);
+        fread(moe->gating_b, sizeof(float), config->num_experts, file);
+
+        // Allocate and read experts
+        moe->experts = malloc(config->num_experts * sizeof(Expert));
+        for (int e = 0; e < config->num_experts; e++)
+        {
+            Expert *expert = &moe->experts[e];
+
+            expert->w1 = malloc(config->embed_dim * config->hidden_dim * sizeof(float));
+            expert->b1 = malloc(config->hidden_dim * sizeof(float));
+            expert->w2 = malloc(config->hidden_dim * config->embed_dim * sizeof(float));
+            expert->b2 = malloc(config->embed_dim * sizeof(float));
+
+            fread(expert->w1, sizeof(float),
+                  config->embed_dim * config->hidden_dim, file);
+            fread(expert->b1, sizeof(float), config->hidden_dim, file);
+            fread(expert->w2, sizeof(float),
+                  config->hidden_dim * config->embed_dim, file);
+            fread(expert->b2, sizeof(float), config->embed_dim, file);
+        }
+    }
+
+    // Allocate and read final layer norm
+    model->final_ln_gamma = malloc(config->embed_dim * sizeof(float));
+    model->final_ln_beta = malloc(config->embed_dim * sizeof(float));
+    fread(model->final_ln_gamma, sizeof(float), config->embed_dim, file);
+    fread(model->final_ln_beta, sizeof(float), config->embed_dim, file);
+
+    fclose(file);
+    printf("✓ Model with metadata loaded from %s\n", filename);
+    printf("  Trained for %d steps, best loss: %.4f, perplexity: %.2f\n",
+           metadata->training_steps, metadata->best_loss, metadata->perplexity);
+    return 1;
 }
 
 int load_model(GPT2_MoE_Model *model, const char *filename)
@@ -2912,138 +3234,302 @@ int sample_from_logits(float *logits, int vocab_size, float temperature, float t
     }
 }
 
-void generate_text(GPT2_MoE_Model *model, RunState *state, Dataset *dataset,
-                   const char *prompt, int max_tokens, float temperature, float top_p)
+int check_repetition(int *tokens, int current_pos, int seq_len, int window_size)
 {
-    Config *config = &model->config;
-    int seq_len = config->seq_len;
+    if (current_pos < window_size * 2)
+        return 0;
 
-    // Start timing
-    struct timeval start_time, end_time;
-    gettimeofday(&start_time, NULL);
-
-    printf("Starting text generation...\n");
-    printf("Prompt: \"%s\"\n", prompt);
-    printf("Max tokens: %d, Temperature: %.2f, Top-p: %.2f\n", max_tokens, temperature, top_p);
-    fflush(stdout);
-
-    // Tokenize prompt
-    int prompt_len = strlen(prompt);
-    int *tokens = malloc(seq_len * sizeof(int));
-    memset(tokens, 0, seq_len * sizeof(int));
-
-    printf("Tokenizing prompt (%d characters)...\n", prompt_len);
-    fflush(stdout);
-
-    // Simple character-level tokenization
-    int valid_tokens = 0;
-    for (int i = 0; i < prompt_len && i < seq_len; i++)
+    int matches = 0;
+    for (int i = 1; i <= window_size && current_pos - i >= 0; i++)
     {
-        char c = prompt[i];
-        int found = 0;
-        for (int v = 0; v < dataset->vocab_size; v++)
+        if (tokens[current_pos - i] == tokens[current_pos - window_size - i])
         {
-            if (dataset->vocab[v][0] == c)
+            matches++;
+        }
+    }
+
+    return matches > window_size * 0.7; // 70% match threshold
+}
+
+void apply_repetition_penalty(float *logits, int *recent_tokens, int recent_count,
+                              int vocab_size, float penalty)
+{
+    for (int i = 0; i < recent_count; i++)
+    {
+        int token = recent_tokens[i];
+        if (token >= 0 && token < vocab_size)
+        {
+            if (logits[token] > 0)
             {
-                tokens[i] = v;
-                found = 1;
-                valid_tokens++;
+                logits[token] /= penalty;
+            }
+            else
+            {
+                logits[token] *= penalty;
+            }
+        }
+    }
+}
+
+int sample_with_quality_control(float *logits, int vocab_size, float temperature,
+                                float top_p, int *recent_tokens, int recent_count,
+                                GenerationConfig *gen_config)
+{
+    // Apply repetition penalty
+    apply_repetition_penalty(logits, recent_tokens, recent_count,
+                             vocab_size, gen_config->repetition_penalty);
+
+    // Apply temperature
+    for (int i = 0; i < vocab_size; i++)
+    {
+        logits[i] /= temperature;
+    }
+
+    // Apply softmax
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++)
+    {
+        if (logits[i] > max_logit)
+            max_logit = logits[i];
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < vocab_size; i++)
+    {
+        logits[i] = exp(logits[i] - max_logit);
+        sum += logits[i];
+    }
+
+    // Normalize
+    for (int i = 0; i < vocab_size; i++)
+    {
+        logits[i] /= sum;
+    }
+
+    // Top-p sampling
+    if (top_p < 1.0f)
+    {
+        typedef struct
+        {
+            float prob;
+            int index;
+        } ProbIndex;
+        ProbIndex *prob_indices = malloc(vocab_size * sizeof(ProbIndex));
+
+        for (int i = 0; i < vocab_size; i++)
+        {
+            prob_indices[i].prob = logits[i];
+            prob_indices[i].index = i;
+        }
+
+        // Sort by probability (simple bubble sort for small vocab)
+        qsort(prob_indices, vocab_size, sizeof(ProbIndex), cmp_prob_desc);
+
+        float cumsum = 0.0f;
+        int cutoff = vocab_size - 1;
+        for (int i = 0; i < vocab_size; i++)
+        {
+            cumsum += prob_indices[i].prob;
+            if (cumsum >= top_p)
+            {
+                cutoff = i;
                 break;
             }
         }
-        if (!found)
+
+        // Sample from top-p subset
+        float r = (float)rand() / RAND_MAX;
+        cumsum = 0.0f;
+        for (int i = 0; i <= cutoff; i++)
         {
-            tokens[i] = 0; // Use default token if character not found
-        }
-    }
-
-    printf("Tokenized %d valid tokens from prompt\n", valid_tokens);
-    printf("Generated: \"");
-    fflush(stdout);
-
-    // Initialize the token buffer with prompt tokens
-    int tokens_generated = 0;
-
-    printf("\nGenerating tokens...\n");
-    fflush(stdout);
-
-    // Generate tokens
-    for (int gen = 0; gen < max_tokens; gen++)
-    {
-        if (gen % 75 == 0 && gen > 0)
-        {
-            printf("\n[Progress: %d/%d tokens]\n", gen, max_tokens);
-            fflush(stdout);
-        }
-
-        // Forward pass
-        forward_pass(model, state, tokens);
-
-        // Get logits for the last position in the sequence
-        int pred_pos = (prompt_len + tokens_generated) % seq_len;
-
-        float *last_logits = &state->logits[pred_pos * config->vocab_size];
-
-        // Sample next token with temperature and top-p
-        int next_token = sample_from_logits(last_logits, config->vocab_size, temperature, top_p);
-
-        // Print the generated character
-        if (next_token < dataset->vocab_size && dataset->vocab[next_token][0] != '\0')
-        {
-            printf("%c", dataset->vocab[next_token][0]);
-            fflush(stdout);
-        }
-        else
-        {
-            printf("?"); // Print ? for unknown tokens
-            fflush(stdout);
-        }
-
-        // Update token buffer - shift all tokens left and add new token at the end
-        if (prompt_len + tokens_generated < seq_len)
-        {
-            // Still filling the initial buffer
-            tokens[prompt_len + tokens_generated] = next_token;
-        }
-        else
-        {
-            // Sliding window: shift all tokens left by 1 and add new token at the end
-            for (int i = 0; i < seq_len - 1; i++)
+            cumsum += prob_indices[i].prob;
+            if (r <= cumsum)
             {
-                tokens[i] = tokens[i + 1];
+                int result = prob_indices[i].index;
+                free(prob_indices);
+                return result;
             }
-            tokens[seq_len - 1] = next_token;
         }
 
-        tokens_generated++;
-
-        // Small delay to make generation visible (but not too slow)
-        if (gen % 25 == 0)
-        {
-            usleep(1000); // 1ms delay every 25 tokens
-        }
+        free(prob_indices);
+        return prob_indices[cutoff].index;
     }
-
-    // End timing
-    gettimeofday(&end_time, NULL);
-
-    // Calculate elapsed time in seconds
-    double elapsed_time = (end_time.tv_sec - start_time.tv_sec) +
-                          (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
-
-    // Calculate tokens per second
-    double tokens_per_second = tokens_generated / elapsed_time;
-
-    printf("\"\n\n");
-    printf("=== Generation Complete ===\n");
-    printf("Tokens generated: %d\n", tokens_generated);
-    printf("Time taken: %.2f seconds\n", elapsed_time);
-    printf("Speed: %.2f tokens/second\n", tokens_per_second);
-    printf("Average time per token: %.4f seconds\n", elapsed_time / tokens_generated);
-
-    free(tokens);
+    else
+    {
+        // Standard sampling
+        float r = (float)rand() / RAND_MAX;
+        float cumsum = 0.0f;
+        for (int i = 0; i < vocab_size; i++)
+        {
+            cumsum += logits[i];
+            if (r <= cumsum)
+                return i;
+        }
+        return vocab_size - 1;
+    }
 }
 
+void generate_text_enhanced(GPT2_MoE_Model *model, RunState *state, Dataset *dataset,
+                            const char *prompt, int max_tokens, float temperature,
+                            float top_p, GenerationConfig *gen_config)
+{
+    Config *config = &model->config;
+    int context_size = config->seq_len;
+
+    printf("\n=== Enhanced Text Generation ===\n");
+    printf("Dataset: %s\n", dataset->name);
+    printf("Prompt: \"%s\"\n", prompt);
+    printf("Parameters: temp=%.2f, top_p=%.2f, max_tokens=%d\n",
+           temperature, top_p, max_tokens);
+    printf("Repetition penalty: %.2f, window: %d\n",
+           gen_config->repetition_penalty, gen_config->repetition_window);
+
+    struct timeval start_time, end_time;
+    gettimeofday(&start_time, NULL);
+
+    // Tokenize prompt
+    int *context = malloc(context_size * sizeof(int));
+    int *recent_tokens = malloc(gen_config->repetition_window * sizeof(int));
+    memset(context, 0, context_size * sizeof(int));
+    memset(recent_tokens, -1, gen_config->repetition_window * sizeof(int));
+
+    int prompt_len = strlen(prompt);
+    int context_pos = 0;
+
+    // Better prompt tokenization
+    if (dataset->use_word_level)
+    {
+        // Word-level tokenization
+        char *prompt_copy = strdup(prompt);
+        char *token = strtok(prompt_copy, " ");
+
+        while (token != NULL && context_pos < context_size - 1)
+        {
+            int found = 0; // UNK token
+            for (int v = 0; v < dataset->vocab_size; v++)
+            {
+                if (strcmp(dataset->vocab[v], token) == 0)
+                {
+                    found = v;
+                    break;
+                }
+            }
+            context[context_pos++] = found;
+            token = strtok(NULL, " ");
+        }
+        free(prompt_copy);
+    }
+    else
+    {
+        // Character-level tokenization
+        for (int i = 0; i < prompt_len && context_pos < context_size - 1; i++)
+        {
+            char c = prompt[i];
+            for (int v = 0; v < dataset->vocab_size; v++)
+            {
+                if (dataset->vocab[v][0] == c)
+                {
+                    context[context_pos++] = v;
+                    break;
+                }
+            }
+        }
+    }
+
+    printf("\nGenerated text:\n\"%s", prompt);
+    fflush(stdout);
+
+    int generated_count = 0;
+    int consecutive_repeats = 0;
+    int recent_pos = 0;
+
+    // Generation loop
+    for (int gen = 0; gen < max_tokens; gen++)
+    {
+        // Forward pass
+        forward_pass(model, state, context);
+
+        // Get logits for the last position
+        int pred_pos = (context_pos - 1) % context_size;
+        float *logits = &state->logits[pred_pos * config->vocab_size];
+
+        // Copy logits for modification
+        float *logits_copy = malloc(config->vocab_size * sizeof(float));
+        memcpy(logits_copy, logits, config->vocab_size * sizeof(float));
+
+        // Sample next token with quality control
+        int next_token = sample_with_quality_control(logits_copy, config->vocab_size,
+                                                     temperature, top_p, recent_tokens,
+                                                     gen_config->repetition_window, gen_config);
+        free(logits_copy);
+
+        // Check for repetition
+        if (check_repetition(context, context_pos, context_size,
+                             gen_config->repetition_window))
+        {
+            consecutive_repeats++;
+            if (consecutive_repeats >= gen_config->max_repetitions &&
+                generated_count >= gen_config->min_tokens)
+            {
+                printf(" [stopped: repetition detected]");
+                break;
+            }
+        }
+        else
+        {
+            consecutive_repeats = 0;
+        }
+
+        // Update recent tokens for repetition penalty
+        recent_tokens[recent_pos] = next_token;
+        recent_pos = (recent_pos + 1) % gen_config->repetition_window;
+
+        // Print generated token
+        if (next_token < dataset->vocab_size)
+        {
+            if (dataset->use_word_level)
+            {
+                printf(" %s", dataset->vocab[next_token]);
+            }
+            else
+            {
+                printf("%c", dataset->vocab[next_token][0]);
+            }
+            fflush(stdout);
+        }
+
+        // Update context with sliding window
+        if (context_pos >= context_size)
+        {
+            // Shift context left and add new token
+            for (int i = 0; i < context_size - 1; i++)
+            {
+                context[i] = context[i + 1];
+            }
+            context[context_size - 1] = next_token;
+        }
+        else
+        {
+            context[context_pos++] = next_token;
+        }
+
+        generated_count++;
+    }
+
+    gettimeofday(&end_time, NULL);
+    double elapsed = (end_time.tv_sec - start_time.tv_sec) +
+                     (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
+
+    printf("\"\n\n=== Generation Statistics ===\n");
+    printf("Tokens generated: %d\n", generated_count);
+    printf("Time taken: %.3f seconds\n", elapsed);
+    printf("Speed: %.2f tokens/second\n", generated_count / elapsed);
+    printf("Repetition penalty applied: %s\n",
+           consecutive_repeats > 0 ? "Yes" : "No");
+
+    free(context);
+    free(recent_tokens);
+}
 // ============================================================================
 // ## 10. MEMORY CLEANUP
 // ============================================================================
