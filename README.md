@@ -15,7 +15,7 @@ But how does that *actually* work?
 - How do you **route only to top-k** and still backprop through choices?  
 - How do you **balance load** so the gate doesn’t fall in love with one expert and ghost the rest?
 
-This repo answers those questions by building the **whole stack**—forward, backward, optimizer, data loader, checkpointing—in **one heavily commented C file**.
+This repo answers those questions by building the **whole stack**—forward, backward, optimizer, data loader, checkpointing—in **one heavily commented C file (please ignore most of them)**.
 
 If you can read C, you can understand MoE.
 
@@ -30,7 +30,7 @@ If you can read C, you can understand MoE.
 - **Training** on a tiny Shakespeare sample (bundled).  
 - **Checkpointing** to `tinymoe.bin` and **reload + inference**.  
 
-All in **~700 lines**. No dependencies. Not even BLAS.
+All in **~4000 lines**. No dependencies. except BLAS maybe.
 
 ---
 
@@ -120,6 +120,7 @@ Token h ──► [Self-Attn] ──► h'
 - CPU only. With `-O3 -march=native` it’s pleasantly snappy on toy scales.  
 - MoE speed comes from **sparsity**: each token hits only `k` experts, not all `E`.  
 - No threading by default—hot loops are easy to spot if you want to add OpenMP.
+- Also has BLAS with standard methods of optimization (whatever you like)
 
 ---
 
