@@ -31,7 +31,7 @@ typedef struct
     int min_tokens;
     int stop_on_repeat;
 } GenerationConfig;
-// Configuration struct to hold all hyperparameters
+
 typedef struct
 {
     int vocab_size;  // size of the vocabulary
@@ -54,7 +54,6 @@ typedef struct
     int capacity;
 } TrainingHistory;
 
-// A single Feed-Forward Network (FFN), which will serve as an "Expert"
 typedef struct
 {
     float *w1; // weight matrix for the first linear layer
@@ -117,7 +116,7 @@ typedef struct
     float perplexity;
 } ModelMetadata;
 
-// Struct to hold the activations during the forward pass (the "state")
+
 typedef struct
 {
     float *embedding_out; // output of embedding layer (seq_len, embed_dim)
@@ -3807,4 +3806,5 @@ void analyze_expert_usage(RunState *state, Config *config, int num_steps)
     }
 
     free(expert_counts);
+
 }
